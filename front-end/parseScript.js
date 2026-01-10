@@ -1,6 +1,6 @@
 async function parseText() {
     const userInput = document.getElementById('userInput').value;
-    const outputArea = document.getElementById('parsed-output');
+    const outputArea = document.getElementById('raw-output');
     const resultsSection = document.getElementById('results-area');
 
     if (!userInput) return alert("Please enter text or a URL");
