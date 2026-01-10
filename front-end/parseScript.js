@@ -1,4 +1,3 @@
-console.log("IT WORKS!")
 async function parseText() {
     const userInput = document.getElementById('userInput').value;
     const outputArea = document.getElementById('parsed-output');
@@ -6,41 +5,51 @@ async function parseText() {
 
     if (!userInput) return alert("Please enter text or a URL");
 
-    // Show the troubleshooting area
     resultsSection.style.display = 'block';
     outputArea.innerText = "Processing... Please wait.";
 
-    // VARIABLE: This will hold our final raw text
     let finalRawText = "";
 
+    // (Extraction logic remains the same)
     if (userInput.startsWith("http")) {
-        // --- CASE 1: IT'S A LINK ---
         try {
-            // We use a proxy to bypass security blocks (CORS)
             const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(userInput)}`;
             const response = await fetch(proxyUrl);
             const data = await response.json();
-            
-            // This creates a temporary element to turn HTML into readable text
             const tempDiv = document.createElement("div");
             tempDiv.innerHTML = data.contents;
-            
-            // Extract text from paragraphs only (to avoid navbars/ads)
             const paragraphs = tempDiv.querySelectorAll('p');
             finalRawText = Array.from(paragraphs).map(p => p.innerText).join('\n\n');
-
-            if (!finalRawText) finalRawText = "Could not extract text. Site might be protected.";
-
         } catch (error) {
-            finalRawText = "Error fetching the link. Check your connection or the URL.";
+            finalRawText = "Error fetching the link.";
         }
     } else {
-        // --- CASE 2: IT'S RAW TEXT ---
         finalRawText = userInput;
     }
 
-    // --- DISPLAY FOR TROUBLESHOOTING ---
-    // The variable 'finalRawText' now holds all your data
-    outputArea.innerText = finalRawText;
-    console.log("Variable 'finalRawText' value:", finalRawText);
+    outputArea.innerText = finalRawText; // Troubleshooting area
+
+    // --- NEW: SEND DATA TO BACKEND ---
+    const backendUrl = "http://127.0.0.1:8000/analyze"; // Your FastAPI URL
+    
+    // Create the JSON object
+    const dataToSend = {
+        raw_text: finalRawText,
+        source: userInput.startsWith("http") ? "url" : "manual_paste"
+    };
+
+    try {
+        const backendResponse = await fetch(backendUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify(dataToSend) // This "converts" the object to a string
+        });
+
+        const result = await backendResponse.json();
+        console.log("Response from Python:", result);
+    } catch (err) {
+        console.error("Backend error:", err);
+    }
 }
