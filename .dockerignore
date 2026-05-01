@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+*.env
+.env
+.git
+.venv/
+back-end/data/
+back-end/testingcode/reports/
+back-end/testingcode/__pycache__/
+warc.paths.gz

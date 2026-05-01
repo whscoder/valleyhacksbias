@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Fact GPT</title>
+    <link rel="stylesheet" href="extension.css" />
+  </head>
+  <body class="popup-body">
+    <main class="popup-shell">
+      <header class="popup-header">
+        <h3 class="brand-title">Fact GPT</h3>
+        <p class="brand-subtitle">Bias and reliability scanner</p>
+      </header>
+
+      <button id="analyze" class="analyze-btn">Analyze Current Page</button>
+      <p id="out" class="status-line" aria-live="polite"></p>
+
+      <section id="thinking-area" class="thinking-area" style="display: none;">
+        <p id="thinking-text" class="thinking-text">AI is reading the screen...</p>
+        <div class="scan-line" aria-hidden="true"></div>
+      </section>
+
+      <section id="results-area_extension" class="results-container" style="display: none;">
+        <div class="summary-box">
+          <h3>Summary</h3>
+          <p class="score-guide-note">Quick guide: 2/10 is low bias, 8/10 is high bias.</p>
+          <div id="parsed-output_bin" class="output-box"></div>
+        </div>
+      </section>
+
+      <section id="sources-area_extension" class="sources-container" style="display: none;">
+        <div class="sources-box">
+          <h3>Sources</h3>
+          <div id="sources-output_bin" class="output-box"></div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
