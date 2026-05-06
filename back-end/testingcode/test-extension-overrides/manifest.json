@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Fact GPT",
+  "version": "1.0.0",
+  "description": "Analyzes news articles for bias and misinformation.",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Fact GPT",
+    "default_popup": "extension.html"
+  },
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*",
+    "https://*.onrender.com/*",
+    "https://*.run.app/*"
+  ]
+}
