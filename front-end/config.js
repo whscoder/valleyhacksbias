@@ -2,7 +2,7 @@ function normalizeBaseUrl(value) {
   return String(value ?? "").trim().replace(/\/+$/, "");
 }
 
-const configuredHostedUrl = "";
+const configuredHostedUrl = "https://bias-article-detector.onrender.com";
 const runtimeOverride = globalThis.FACTGPT_BACKEND_URL;
 const fallbackLocalUrl = "http://127.0.0.1:8000";
 
