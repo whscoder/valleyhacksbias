@@ -1,16 +1,15 @@
 :root {
-  --bg-0: #08111f;
-  --bg-1: #122338;
-  --bg-2: #1a3352;
-  --card: rgba(12, 22, 37, 0.74);
-  --card-border: rgba(255, 255, 255, 0.12);
-  --text-main: #f5f8fc;
-  --text-soft: #b9c8db;
-  --accent: #7ab8ff;
-  --accent-2: #9be7d2;
-  --chip-bg: rgba(122, 184, 255, 0.14);
-  --danger: #ff8f9f;
-  --shadow-soft: 0 16px 34px rgba(0, 0, 0, 0.22);
+  --bg-0: #f7f9fc;
+  --bg-1: #eef3f8;
+  --card: #ffffff;
+  --card-border: #dce3ec;
+  --text-main: #142033;
+  --text-soft: #66758a;
+  --accent: #2563eb;
+  --accent-2: #0f766e;
+  --chip-bg: #eef6ff;
+  --danger: #b42318;
+  --shadow-soft: 0 10px 24px rgba(20, 32, 51, 0.08);
 }
 
 * {
@@ -25,7 +24,7 @@ body {
   height: 560px;
   overflow-x: hidden;
   overflow-y: hidden;
-  border-radius: 24px;
+  border-radius: 12px;
   background: transparent;
 }
 
@@ -35,13 +34,10 @@ body {
   height: 100%;
   padding: 10px;
   overflow: hidden;
-  border-radius: 24px;
+  border-radius: 12px;
   color: var(--text-main);
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
-  background:
-    radial-gradient(140px 110px at 85% 10%, rgba(155, 231, 210, 0.16), transparent 75%),
-    radial-gradient(180px 130px at 8% 0%, rgba(122, 184, 255, 0.2), transparent 72%),
-    linear-gradient(160deg, var(--bg-0), var(--bg-1) 52%, var(--bg-2));
+  background: linear-gradient(180deg, var(--bg-0), var(--bg-1));
 }
 
 .popup-shell {
@@ -54,12 +50,12 @@ body {
   flex-direction: column;
   gap: 13px;
   overflow-y: auto;
-  border-radius: 20px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.015));
-  box-shadow: 0 20px 36px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  border-radius: 10px;
+  border: 1px solid var(--card-border);
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: var(--shadow-soft);
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+  scrollbar-color: rgba(102, 117, 138, 0.32) transparent;
   -webkit-overflow-scrolling: touch;
 }
 
@@ -73,7 +69,7 @@ body {
 
 .popup-shell::-webkit-scrollbar-thumb {
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.18);
+  background: rgba(102, 117, 138, 0.28);
 }
 
 .popup-header {
@@ -86,8 +82,8 @@ body {
   margin: 0;
   font-size: 1.18rem;
   font-weight: 700;
-  letter-spacing: -0.02em;
-  color: #f7fbff;
+  letter-spacing: 0;
+  color: var(--text-main);
 }
 
 .brand-subtitle {
@@ -97,14 +93,14 @@ body {
 }
 
 .analyze-btn {
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 14px;
+  border: 1px solid #1d4ed8;
+  border-radius: 8px;
   padding: 12px 14px;
   font-size: 0.9rem;
   font-weight: 700;
-  color: #f7fbff;
-  background: linear-gradient(180deg, rgba(132, 187, 255, 0.92), rgba(91, 146, 241, 0.88));
-  box-shadow: 0 10px 22px rgba(70, 123, 214, 0.28);
+  color: #ffffff;
+  background: var(--accent);
+  box-shadow: 0 8px 16px rgba(37, 99, 235, 0.18);
   cursor: pointer;
   transition: transform 120ms ease, filter 120ms ease, box-shadow 120ms ease;
 }
@@ -112,7 +108,7 @@ body {
 .analyze-btn:hover {
   transform: translateY(-1px);
   filter: brightness(1.05);
-  box-shadow: 0 12px 28px rgba(70, 123, 214, 0.34);
+  box-shadow: 0 10px 20px rgba(37, 99, 235, 0.22);
 }
 
 .analyze-btn:active {
@@ -123,17 +119,16 @@ body {
   margin: 0;
   min-height: 18px;
   font-size: 0.8rem;
-  color: #d6ecff;
+  color: #2453a6;
 }
 
 .thinking-area {
   position: relative;
   overflow: hidden;
   border: 1px solid var(--card-border);
-  border-radius: 18px;
+  border-radius: 8px;
   background: var(--card);
   padding: 12px;
-  backdrop-filter: blur(16px);
   box-shadow: var(--shadow-soft);
 }
 
@@ -154,9 +149,9 @@ body {
 .thinking-text {
   margin: 0;
   font-family: "Courier New", "Lucida Console", monospace;
-  color: #dffaff;
+  color: #2453a6;
   font-size: 0.8rem;
-  letter-spacing: 0.02em;
+  letter-spacing: 0;
 }
 
 .scan-line {
@@ -165,9 +160,9 @@ body {
   height: 30%;
   background: linear-gradient(
     to bottom,
-    rgba(145, 255, 208, 0),
-    rgba(145, 255, 208, 0.35),
-    rgba(145, 255, 208, 0)
+    rgba(37, 99, 235, 0),
+    rgba(37, 99, 235, 0.22),
+    rgba(37, 99, 235, 0)
   );
   animation: scan 1.25s linear infinite;
   pointer-events: none;
@@ -181,10 +176,9 @@ body {
 .summary-box,
 .sources-box {
   border: 1px solid var(--card-border);
-  border-radius: 18px;
+  border-radius: 8px;
   background: var(--card);
   padding: 12px;
-  backdrop-filter: blur(16px);
   box-shadow: var(--shadow-soft);
 }
 
@@ -193,7 +187,7 @@ body {
   margin: 0 0 8px;
   font-size: 0.72rem;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
   color: var(--accent-2);
 }
 
@@ -222,7 +216,7 @@ body {
 }
 
 .metric-line strong {
-  color: #c8ecff;
+  color: var(--text-main);
 }
 
 .score-pill {
@@ -231,9 +225,9 @@ body {
   border-radius: 999px;
   margin-left: 7px;
   font-size: 0.85rem;
-  background: rgba(122, 184, 255, 0.14);
-  border: 1px solid rgba(122, 184, 255, 0.28);
-  color: #eef6ff;
+  background: #eef6ff;
+  border: 1px solid #bfdbfe;
+  color: #1d4ed8;
 }
 
 .copy-block {
@@ -244,7 +238,7 @@ body {
 }
 
 .copy-block strong {
-  color: #d8f8ff;
+  color: var(--text-main);
 }
 
 .bias-chip-grid {
@@ -258,20 +252,24 @@ body {
   display: inline-flex;
   align-items: center;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  border: 1px solid #bfdbfe;
   background: var(--chip-bg);
-  color: #eaf8ff;
+  color: #1d4ed8;
   padding: 5px 10px;
   font-size: 0.76rem;
+  font-family: inherit;
+  font-weight: 650;
   line-height: 1.2;
-  cursor: help;
+  cursor: pointer;
+  text-align: left;
 }
 
 .bias-chip:hover,
-.bias-chip:focus-visible {
+.bias-chip:focus-visible,
+.bias-chip-active {
   outline: none;
-  border-color: rgba(145, 255, 208, 0.72);
-  box-shadow: 0 0 0 2px rgba(145, 255, 208, 0.2);
+  border-color: #2563eb;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.16);
 }
 
 .chip-tooltip {
@@ -284,16 +282,16 @@ body {
   transform: translateX(-50%);
   min-width: 170px;
   max-width: 250px;
-  border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(16, 22, 34, 0.96);
+  border-radius: 8px;
+  border: 1px solid #dce3ec;
+  background: #142033;
   padding: 8px;
   font-size: 0.7rem;
   line-height: 1.35;
-  color: #deefff;
+  color: #f7f9fc;
   z-index: 15;
   transition: opacity 120ms ease;
-  box-shadow: 0 16px 28px rgba(0, 0, 0, 0.28);
+  box-shadow: 0 12px 24px rgba(20, 32, 51, 0.22);
 }
 
 .bias-chip:hover .chip-tooltip,
@@ -316,15 +314,15 @@ body {
 }
 
 .source-item {
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  background: #f8fafc;
   padding: 8px;
 }
 
 .source-link {
   display: block;
-  color: #94f9dc;
+  color: var(--accent);
   font-size: 0.78rem;
   font-weight: 700;
   text-decoration: none;
@@ -337,7 +335,7 @@ body {
 
 .source-hint {
   margin: 0;
-  color: #cadeff;
+  color: var(--text-soft);
   font-size: 0.72rem;
 }
 

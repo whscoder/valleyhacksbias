@@ -8,6 +8,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.log
+*.zip
 *.pem
 *.key
 *.crt
@@ -18,4 +19,5 @@ __pycache__/
 back-end/data/
 back-end/testingcode/reports/
 back-end/testingcode/__pycache__/
+backups/
 warc.paths.gz

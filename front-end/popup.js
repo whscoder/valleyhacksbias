@@ -94,7 +94,7 @@ if (!analyzeButton || !out) {
       // Fallback order: fast backend extraction -> current tab DOM text -> Playwright.
       let parseResult = await parseText(capturedUrl, (statusMessage) => {
         out.textContent = statusMessage;
-      });
+      }, { tabId });
 
       if (!parseResult.ok && tabId !== null && shouldFallbackToDom(parseResult.error)) {
         out.textContent = "Site blocks direct fetch. Reading visible page text...";
@@ -103,7 +103,7 @@ if (!analyzeButton || !out) {
           if (tabText.length >= 200) {
             parseResult = await parseText(tabText, (statusMessage) => {
               out.textContent = statusMessage;
-            });
+            }, { tabId });
           }
         } catch {
           // Keep the original extraction error if the DOM fallback cannot run.
@@ -114,7 +114,7 @@ if (!analyzeButton || !out) {
         out.textContent = "Trying browser-rendered extraction (last resort)...";
         parseResult = await parseText(capturedUrl, (statusMessage) => {
           out.textContent = statusMessage;
-        }, { extractEndpoint: "/extract-rendered" });
+        }, { extractEndpoint: "/extract-rendered", tabId });
       }
 
       if (!parseResult.ok) {

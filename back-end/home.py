@@ -1,15 +1,20 @@
 import asyncio
+from collections import defaultdict, deque
+import ipaddress
 import json
 import os
 from pathlib import Path
+import socket
+import time
 from typing import Any
 
 import httpx
 import uvicorn
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel, HttpUrl
 
@@ -26,13 +31,19 @@ except Exception:
 MODEL_NAME = "gpt-4o-mini"
 MIN_EXTRACT_CHARS = 200
 MAX_RESEARCH_INPUT_CHARS = 6000
+MAX_ANALYSIS_INPUT_CHARS = 12000
 HTTP_CONNECT_TIMEOUT_SECONDS = 10
 HTTP_READ_TIMEOUT_SECONDS = 15
 BROWSER_TIMEOUT_MS = 30000
+DEFAULT_ALLOWED_ORIGIN_REGEX = r"^chrome-extension://[a-z]{32}$|^http://(127\.0\.0\.1|localhost)(:\d+)?$"
+BLOCKED_HOSTNAMES = {"localhost", "localhost.localdomain"}
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_REQUESTS = int(os.getenv("FACTGPT_RATE_LIMIT_PER_MINUTE", "45"))
 
 
 # FastAPI app used by the extension popup/frontend.
 app = FastAPI()
+request_timestamps_by_client: dict[str, deque[float]] = defaultdict(deque)
 
 # Load local API key used by backend model calls.
 load_dotenv(Path(__file__).resolve().parent / "data" / "apikey.env")
@@ -46,11 +57,40 @@ client = AsyncOpenAI(api_key=api_key)
 # Allow the browser extension UI to call this local backend.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv("FACTGPT_ALLOWED_ORIGINS", "").split(",")
+        if origin.strip()
+    ],
+    allow_origin_regex=os.getenv("FACTGPT_ALLOWED_ORIGIN_REGEX", DEFAULT_ALLOWED_ORIGIN_REGEX),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
+
+
+@app.middleware("http")
+async def rate_limit_requests(request: Request, call_next):
+    """Simple per-client guard for public AI endpoints."""
+    if request.method == "OPTIONS" or request.url.path == "/":
+        return await call_next(request)
+
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    client_id = forwarded_for.split(",", 1)[0].strip() or (request.client.host if request.client else "unknown")
+    now = time.monotonic()
+    timestamps = request_timestamps_by_client[client_id]
+
+    while timestamps and now - timestamps[0] > RATE_LIMIT_WINDOW_SECONDS:
+        timestamps.popleft()
+
+    if len(timestamps) >= RATE_LIMIT_REQUESTS:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many requests. Please wait and try again."},
+        )
+
+    timestamps.append(now)
+    return await call_next(request)
 
 
 class AnalyzeRequest(BaseModel):
@@ -106,6 +146,51 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def normalize_analysis_text(text: str) -> str:
+    """Trim large requests before sending content to model endpoints."""
+    normalized = str(text or "").strip()
+    if len(normalized) > MAX_ANALYSIS_INPUT_CHARS:
+        return normalized[:MAX_ANALYSIS_INPUT_CHARS]
+    return normalized
+
+
+def is_public_ip(address: str) -> bool:
+    """Return true only for public internet IP addresses."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return ip.is_global
+
+
+async def validate_public_url(url: str) -> None:
+    """Block local/private network fetch targets before extraction."""
+    parsed = httpx.URL(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="Only http and https URLs are supported.")
+
+    hostname = (parsed.host or "").rstrip(".").lower()
+    if not hostname:
+        raise HTTPException(status_code=400, detail="URL hostname is missing.")
+    if hostname in BLOCKED_HOSTNAMES or hostname.endswith(".local"):
+        raise HTTPException(status_code=400, detail="Local network URLs are not supported.")
+
+    if not is_public_ip(hostname):
+        try:
+            addresses = await asyncio.to_thread(
+                socket.getaddrinfo,
+                hostname,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as exc:
+            raise HTTPException(status_code=400, detail="URL hostname could not be resolved.") from exc
+
+        resolved_ips = {entry[4][0] for entry in addresses}
+        if not resolved_ips or any(not is_public_ip(address) for address in resolved_ips):
+            raise HTTPException(status_code=400, detail="Private or internal network URLs are not supported.")
 
 
 def _load_json_object(candidate: Any) -> dict | None:
@@ -415,6 +500,7 @@ async def root():
 async def extract_text(req: URLRequest):
     """Fast path: extract readable article text from a URL using httpx + BeautifulSoup only."""
     url = str(req.url)
+    await validate_public_url(url)
 
     text, reason = await extract_text_with_httpx(url)
     if text:
@@ -428,6 +514,7 @@ async def extract_text(req: URLRequest):
 async def extract_text_rendered(req: URLRequest):
     """Last-resort extraction using Playwright for JS-heavy or protected pages."""
     url = str(req.url)
+    await validate_public_url(url)
     try:
         rendered_html = await fetch_html_with_playwright(url)
         rendered_text = extract_readable_text(rendered_html)
@@ -441,9 +528,13 @@ async def extract_text_rendered(req: URLRequest):
 @app.post("/analyze")
 async def analyze(article: AnalyzeRequest):
     """Run bias + research in parallel and return the combined response."""
+    text = normalize_analysis_text(article.text)
+    if len(text) < MIN_EXTRACT_CHARS:
+        raise HTTPException(status_code=400, detail="Not enough text to analyze.")
+
     bias_raw, research_raw = await asyncio.gather(
-        analyze_bias(article.text),
-        researcher_ai(article.text),
+        analyze_bias(text),
+        researcher_ai(text),
     )
 
     if "error" in bias_raw:
@@ -461,7 +552,11 @@ async def analyze(article: AnalyzeRequest):
 @app.post("/analyze-bias")
 async def receive_bias(article: AnalyzeRequest):
     """Run only the bias-analysis step."""
-    bias_raw = await analyze_bias(article.text)
+    text = normalize_analysis_text(article.text)
+    if len(text) < MIN_EXTRACT_CHARS:
+        raise HTTPException(status_code=400, detail="Not enough text to analyze.")
+
+    bias_raw = await analyze_bias(text)
     if "error" in bias_raw:
         raise HTTPException(status_code=502, detail=bias_raw["error"])
     return {"status": "bias_analyzed", "ai_result": validate_ai_bias(bias_raw)}
@@ -470,7 +565,11 @@ async def receive_bias(article: AnalyzeRequest):
 @app.post("/research")
 async def receive_research(article: AnalyzeRequest):
     """Run only the research/cross-check step."""
-    research_raw = await researcher_ai(article.text)
+    text = normalize_analysis_text(article.text)
+    if len(text) < MIN_EXTRACT_CHARS:
+        raise HTTPException(status_code=400, detail="Not enough text to research.")
+
+    research_raw = await researcher_ai(text)
     if "error" in research_raw:
         raise HTTPException(status_code=502, detail=research_raw["error"])
     return {"status": "researched", "ai_research": validate_ai_research(research_raw)}

@@ -166,6 +166,214 @@ function pickReasonForHighlight(phrase, reasonCandidates) {
   return bestReason;
 }
 
+function canScriptActivePage(tabId) {
+  return (
+    Number.isInteger(tabId) &&
+    typeof chrome !== "undefined" &&
+    Boolean(chrome?.scripting?.executeScript)
+  );
+}
+
+// Injects page-side markup for bias phrases and optionally scrolls to one phrase.
+async function highlightPhrasesInTab(tabId, phrases, selectedPhrase = "") {
+  const normalizedPhrases = normalizeHighlights(phrases);
+  if (!canScriptActivePage(tabId) || !normalizedPhrases.length) {
+    return { ok: false, matchedCount: 0 };
+  }
+
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      args: [normalizedPhrases, String(selectedPhrase ?? "")],
+      func: (rawPhrases, targetPhrase) => {
+        const HIGHLIGHT_CLASS = "factgpt-bias-highlight";
+        const ACTIVE_CLASS = "factgpt-bias-highlight-active";
+        const STYLE_ID = "factgpt-bias-highlight-style";
+
+        const normalize = (value) => String(value ?? "").trim().toLowerCase();
+        const phrases = Array.from(new Set(
+          rawPhrases
+            .map((phrase) => String(phrase ?? "").trim())
+            .filter(Boolean)
+        ))
+          .sort((a, b) => b.length - a.length)
+          .map((phrase) => ({ text: phrase, lower: phrase.toLowerCase() }));
+
+        document.querySelectorAll(`span.${HIGHLIGHT_CLASS}`).forEach((node) => {
+          node.replaceWith(document.createTextNode(node.textContent || ""));
+        });
+        document.body?.normalize();
+
+        if (!phrases.length || !document.body) {
+          return { ok: false, matchedCount: 0 };
+        }
+
+        let style = document.getElementById(STYLE_ID);
+        if (!style) {
+          style = document.createElement("style");
+          style.id = STYLE_ID;
+          style.textContent = `
+            .${HIGHLIGHT_CLASS} {
+              background: #fff176 !important;
+              color: inherit !important;
+              box-shadow: 0 0 0 2px rgba(255, 193, 7, 0.42) !important;
+              border-radius: 3px !important;
+              padding: 0 2px !important;
+            }
+            .${ACTIVE_CLASS} {
+              background: #ffca28 !important;
+              box-shadow: 0 0 0 3px rgba(245, 124, 0, 0.6) !important;
+            }
+          `;
+          document.head.appendChild(style);
+        }
+
+        const ignoredParents = new Set([
+          "SCRIPT",
+          "STYLE",
+          "NOSCRIPT",
+          "TEXTAREA",
+          "INPUT",
+          "SELECT",
+          "OPTION",
+          "BUTTON"
+        ]);
+
+        const walker = document.createTreeWalker(
+          document.body,
+          NodeFilter.SHOW_TEXT,
+          {
+            acceptNode(node) {
+              const parent = node.parentElement;
+              if (!parent || ignoredParents.has(parent.tagName)) {
+                return NodeFilter.FILTER_REJECT;
+              }
+
+              if (parent.closest(`.${HIGHLIGHT_CLASS}`)) {
+                return NodeFilter.FILTER_REJECT;
+              }
+
+              return node.nodeValue && node.nodeValue.trim()
+                ? NodeFilter.FILTER_ACCEPT
+                : NodeFilter.FILTER_REJECT;
+            }
+          }
+        );
+
+        const textNodes = [];
+        while (walker.nextNode()) {
+          textNodes.push(walker.currentNode);
+        }
+
+        const selected = normalize(targetPhrase);
+        const matched = [];
+
+        for (const textNode of textNodes) {
+          const text = textNode.nodeValue || "";
+          const lowerText = text.toLowerCase();
+          const matches = [];
+          let cursor = 0;
+
+          while (cursor < text.length) {
+            let best = null;
+
+            for (const phrase of phrases) {
+              const index = lowerText.indexOf(phrase.lower, cursor);
+              if (index === -1) {
+                continue;
+              }
+
+              if (
+                !best ||
+                index < best.index ||
+                (index === best.index && phrase.text.length > best.phrase.text.length)
+              ) {
+                best = { index, phrase };
+              }
+            }
+
+            if (!best) {
+              break;
+            }
+
+            matches.push({
+              start: best.index,
+              end: best.index + best.phrase.text.length,
+              phrase: best.phrase.text
+            });
+            cursor = best.index + Math.max(best.phrase.text.length, 1);
+          }
+
+          if (!matches.length) {
+            continue;
+          }
+
+          const fragment = document.createDocumentFragment();
+          let lastIndex = 0;
+          for (const match of matches) {
+            if (match.start > lastIndex) {
+              fragment.appendChild(document.createTextNode(text.slice(lastIndex, match.start)));
+            }
+
+            const span = document.createElement("span");
+            span.className = HIGHLIGHT_CLASS;
+            if (selected && normalize(match.phrase) === selected) {
+              span.classList.add(ACTIVE_CLASS);
+            }
+            span.dataset.factgptPhrase = match.phrase;
+            span.textContent = text.slice(match.start, match.end);
+            fragment.appendChild(span);
+            matched.push(span);
+            lastIndex = match.end;
+          }
+
+          if (lastIndex < text.length) {
+            fragment.appendChild(document.createTextNode(text.slice(lastIndex)));
+          }
+
+          textNode.replaceWith(fragment);
+        }
+
+        const activeMatch = selected
+          ? matched.find((node) => normalize(node.dataset.factgptPhrase) === selected)
+          : null;
+
+        if (activeMatch) {
+          activeMatch.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
+        }
+
+        let browserFoundSelection = false;
+        if (!activeMatch && selected) {
+          try {
+            window.getSelection()?.removeAllRanges();
+            browserFoundSelection = window.find(
+              targetPhrase,
+              false,
+              false,
+              true,
+              false,
+              true,
+              false
+            );
+          } catch {
+            browserFoundSelection = false;
+          }
+        }
+
+        return {
+          ok: true,
+          matchedCount: matched.length,
+          scrolled: Boolean(activeMatch) || browserFoundSelection
+        };
+      }
+    });
+
+    return injection?.result || { ok: false, matchedCount: 0 };
+  } catch {
+    return { ok: false, matchedCount: 0 };
+  }
+}
+
 // Controls the animated "thinking" status shown while the backend is processing.
 function createThinkingController(thinkingArea, thinkingText) {
   if (!thinkingArea || !thinkingText) {
@@ -215,7 +423,7 @@ function setOutputMessage(outputArea, message, isError = false) {
 }
 
 // Renders highlight chips and attaches tooltip reasons for each phrase.
-function renderBiasHighlights(highlights, explanation) {
+function renderBiasHighlights(highlights, explanation, options = {}) {
   const wrap = document.createElement("div");
   wrap.className = "bias-chip-grid";
 
@@ -232,10 +440,18 @@ function renderBiasHighlights(highlights, explanation) {
   for (const phrase of highlights) {
     const reason = pickReasonForHighlight(phrase, reasonCandidates);
 
-    const chip = document.createElement("span");
+    const chip = document.createElement("button");
+    chip.type = "button";
     chip.className = "bias-chip";
-    chip.tabIndex = 0;
     chip.textContent = phrase;
+    chip.title = "Find this phrase on the page";
+    chip.addEventListener("click", async () => {
+      wrap.querySelectorAll(".bias-chip").forEach((button) => {
+        button.classList.remove("bias-chip-active");
+      });
+      chip.classList.add("bias-chip-active");
+      await options.onHighlightClick?.(phrase);
+    });
 
     const tooltip = document.createElement("span");
     tooltip.className = "chip-tooltip";
@@ -265,7 +481,7 @@ function createSimplifiedCopy(label, value, maxItems = 2, maxChars = 140) {
 }
 
 // Renders the bias-analysis card returned by the backend.
-function renderResult(outputArea, ai) {
+function renderResult(outputArea, ai, options = {}) {
   outputArea.innerHTML = "";
 
   const card = document.createElement("div");
@@ -286,10 +502,10 @@ function renderResult(outputArea, ai) {
   highlightsHeader.className = "copy-block";
   const highlightsLabel = document.createElement("strong");
   highlightsLabel.textContent = "Bias Keywords";
-  highlightsHeader.append(highlightsLabel, document.createTextNode(": hover for reasoning"));
+  highlightsHeader.append(highlightsLabel, document.createTextNode(": click to find on page"));
 
   const highlights = normalizeHighlights(ai.highlights);
-  const highlightsWrap = renderBiasHighlights(highlights, ai.explanation);
+  const highlightsWrap = renderBiasHighlights(highlights, ai.explanation, options);
 
   const missing = createSimplifiedCopy("Missing Perspectives", ai.missing_perspectives, 2, 130);
 
@@ -373,7 +589,7 @@ function collectSourceLinks(aiResearch) {
 // Opens a cited source in a new browser tab (extension-safe when available).
 function openExternalSource(url) {
   if (typeof chrome !== "undefined" && chrome?.tabs?.create) {
-    chrome.tabs.create({ url });
+    chrome.tabs.create({ url, active: false });
     return;
   }
 
@@ -403,6 +619,7 @@ function renderSources(sourcesOutput, sourcesSection, aiResearch) {
     anchor.href = link.url;
     anchor.className = "source-link";
     anchor.textContent = link.title;
+    anchor.title = "Open source in a background tab";
     anchor.addEventListener("click", (event) => {
       event.preventDefault();
       openExternalSource(link.url);
@@ -513,7 +730,12 @@ export async function parseText(url, updateStatus = () => {}, options = {}) {
 
     // Show the bias result immediately even if source-research fails later.
     const aiBiasResult = biasResult.ai_result || {};
-    renderResult(outputArea, aiBiasResult);
+    const biasHighlights = normalizeHighlights(aiBiasResult.highlights);
+    const tabId = Number.isInteger(options.tabId) ? options.tabId : null;
+    renderResult(outputArea, aiBiasResult, {
+      onHighlightClick: (phrase) => highlightPhrasesInTab(tabId, biasHighlights, phrase)
+    });
+    highlightPhrasesInTab(tabId, biasHighlights);
 
     thinking.setPhase("Finding sources");
     setStatus("Bias complete. Gathering sources...");
