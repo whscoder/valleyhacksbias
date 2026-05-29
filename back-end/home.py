@@ -39,6 +39,10 @@ DEFAULT_ALLOWED_ORIGIN_REGEX = r"^chrome-extension://[a-z]{32}$|^http://(127\.0\
 BLOCKED_HOSTNAMES = {"localhost", "localhost.localdomain"}
 RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_REQUESTS = int(os.getenv("FACTGPT_RATE_LIMIT_PER_MINUTE", "45"))
+SERVICE_NAME = "factgpt-backend"
+# Health probes may run on every popup open, so they stay cheap and unmetered.
+HEALTHCHECK_PATHS = {"/", "/health"}
+STARTED_AT_MONOTONIC = time.monotonic()
 
 
 # FastAPI app used by the extension popup/frontend.
@@ -72,7 +76,7 @@ app.add_middleware(
 @app.middleware("http")
 async def rate_limit_requests(request: Request, call_next):
     """Simple per-client guard for public AI endpoints."""
-    if request.method == "OPTIONS" or request.url.path == "/":
+    if request.method == "OPTIONS" or request.url.path in HEALTHCHECK_PATHS:
         return await call_next(request)
 
     forwarded_for = request.headers.get("x-forwarded-for", "")
@@ -139,6 +143,15 @@ class LegacyAIresultResearch(BaseModel):
 class URLRequest(BaseModel):
     """Input payload for URL extraction endpoint."""
     url: HttpUrl
+
+
+def build_health_response() -> dict[str, Any]:
+    """Return a fast liveness payload without touching external services."""
+    return {
+        "status": "ok",
+        "service": SERVICE_NAME,
+        "uptime_seconds": round(time.monotonic() - STARTED_AT_MONOTONIC, 3),
+    }
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -492,8 +505,14 @@ def validate_ai_research(ai: dict) -> AIresultResearch:
 
 @app.get("/")
 async def root():
-    """Health check endpoint used to confirm the API is running."""
-    return {"status": "API is running"}
+    """Backwards-compatible root probe for hosts and manual checks."""
+    return build_health_response()
+
+
+@app.get("/health")
+async def health_check():
+    """Cheap wake/liveness endpoint for Render and extension warm-up pings."""
+    return build_health_response()
 
 
 @app.post("/extract")
