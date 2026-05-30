@@ -1,30 +1,9 @@
-import { BACKEND_BASE_URLS } from "./config.js";
+import { fetchBackend } from "./api.js";
 
 const THINKING_DOT_MS = 180;
 
-function buildBackendUrl(baseUrl, endpoint) {
-  const normalizedBase = String(baseUrl ?? "").replace(/\/+$/, "");
-  const normalizedEndpoint = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
-  return `${normalizedBase}${normalizedEndpoint}`;
-}
-
-async function fetchBackend(endpoint, init) {
-  let lastError = null;
-
-  for (const baseUrl of BACKEND_BASE_URLS) {
-    try {
-      const response = await fetch(buildBackendUrl(baseUrl, endpoint), init);
-      return response;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError ?? new Error("No reachable backend URL is configured.");
-}
-
 // Converts arrays/values into a clean display string with a fallback.
-function normalizeText(value, fallback = "N/A") {
+export function normalizeText(value, fallback = "N/A") {
   if (Array.isArray(value)) {
     const joined = value
       .map((item) => String(item ?? "").trim())
@@ -98,7 +77,7 @@ function simplifyBulletText(value, maxItems = 2, maxChars = 140) {
 }
 
 // Deduplicates bias highlight phrases while preserving original order.
-function normalizeHighlights(highlights) {
+export function normalizeHighlights(highlights) {
   if (!Array.isArray(highlights)) {
     return [];
   }
@@ -175,7 +154,7 @@ function canScriptActivePage(tabId) {
 }
 
 // Injects page-side markup for bias phrases and optionally scrolls to one phrase.
-async function highlightPhrasesInTab(tabId, phrases, selectedPhrase = "") {
+export async function highlightPhrasesInTab(tabId, phrases, selectedPhrase = "") {
   const normalizedPhrases = normalizeHighlights(phrases);
   if (!canScriptActivePage(tabId) || !normalizedPhrases.length) {
     return { ok: false, matchedCount: 0 };
@@ -411,7 +390,7 @@ function createThinkingController(thinkingArea, thinkingText) {
 }
 
 // Resets the result area and shows a single status/error line.
-function setOutputMessage(outputArea, message, isError = false) {
+export function setOutputMessage(outputArea, message, isError = false) {
   outputArea.innerHTML = "";
   const line = document.createElement("p");
   line.className = "copy-block";
@@ -481,7 +460,7 @@ function createSimplifiedCopy(label, value, maxItems = 2, maxChars = 140) {
 }
 
 // Renders the bias-analysis card returned by the backend.
-function renderResult(outputArea, ai, options = {}) {
+export function renderResult(outputArea, ai, options = {}) {
   outputArea.innerHTML = "";
 
   const card = document.createElement("div");
@@ -496,6 +475,7 @@ function renderResult(outputArea, ai, options = {}) {
   scorePill.textContent = `${normalizeText(ai.bias_score, "N/A")} / 10`;
   metric.append(metricLabel, scorePill);
 
+  const summary = createLabeledCopy("Quick Summary", ai.summary);
   const explanation = createSimplifiedCopy("Explanation", ai.explanation, 2, 135);
 
   const highlightsHeader = document.createElement("p");
@@ -509,7 +489,7 @@ function renderResult(outputArea, ai, options = {}) {
 
   const missing = createSimplifiedCopy("Missing Perspectives", ai.missing_perspectives, 2, 130);
 
-  card.append(metric, explanation, highlightsHeader, highlightsWrap, missing);
+  card.append(metric, summary, explanation, highlightsHeader, highlightsWrap, missing);
   outputArea.appendChild(card);
 }
 
@@ -597,7 +577,7 @@ function openExternalSource(url) {
 }
 
 // Renders the source list section only when research links are available.
-function renderSources(sourcesOutput, sourcesSection, aiResearch) {
+export function renderSources(sourcesOutput, sourcesSection, aiResearch) {
   sourcesOutput.innerHTML = "";
   const links = collectSourceLinks(aiResearch);
 

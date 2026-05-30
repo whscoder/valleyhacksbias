@@ -92,6 +92,20 @@ body {
   color: var(--text-soft);
 }
 
+.health-area {
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 8px 10px;
+}
+
+.health-line {
+  margin: 0;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: var(--text-soft);
+}
+
 .analyze-btn {
   border: 1px solid #1d4ed8;
   border-radius: 8px;

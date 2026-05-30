@@ -40,8 +40,10 @@ BLOCKED_HOSTNAMES = {"localhost", "localhost.localdomain"}
 RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_REQUESTS = int(os.getenv("FACTGPT_RATE_LIMIT_PER_MINUTE", "45"))
 SERVICE_NAME = "factgpt-backend"
+COLD_START_WINDOW_SECONDS = 120
 # Health probes may run on every popup open, so they stay cheap and unmetered.
 HEALTHCHECK_PATHS = {"/", "/health"}
+STARTED_AT_UNIX = time.time()
 STARTED_AT_MONOTONIC = time.monotonic()
 
 
@@ -106,6 +108,7 @@ class AnalyzeRequest(BaseModel):
 class AIresultBias(BaseModel):
     """Normalized bias-analysis response returned to the frontend."""
     bias_score: int
+    summary: str
     highlights: list[str]
     explanation: str
     missing_perspectives: str
@@ -146,11 +149,17 @@ class URLRequest(BaseModel):
 
 
 def build_health_response() -> dict[str, Any]:
-    """Return a fast liveness payload without touching external services."""
+    """Return liveness and cold-start metrics without touching external services."""
+    uptime_seconds = time.monotonic() - STARTED_AT_MONOTONIC
     return {
         "status": "ok",
         "service": SERVICE_NAME,
-        "uptime_seconds": round(time.monotonic() - STARTED_AT_MONOTONIC, 3),
+        "server_time_unix": round(time.time(), 3),
+        "process_started_at_unix": round(STARTED_AT_UNIX, 3),
+        "uptime_seconds": round(uptime_seconds, 3),
+        # True wake latency is measured by the client request duration.
+        # This flag tells you whether the request hit a recently started process.
+        "recent_process_start": uptime_seconds < COLD_START_WINDOW_SECONDS,
     }
 
 

@@ -7,9 +7,10 @@ You MUST return ONLY valid JSON that matches the schema below and nothing else.
 
 Goals:
 1) Identify biased / loaded language and framing.
-2) Explain why it is biased in a neutral, educational tone.
-3) Suggest missing perspectives (who/what is not represented).
-4) Keep the output grounded ONLY in the provided text. Do not invent facts.
+2) Summarize the article in neutral language.
+3) Explain why it is biased in a neutral, educational tone.
+4) Suggest missing perspectives (who/what is not represented).
+5) Keep the output grounded ONLY in the provided text. Do not invent facts.
 
 Definitions:
 - "Bias" includes: loaded language, emotional framing, one-sided sourcing, unsupported certainty, cherry-picking, omission of context, ad hominem, stereotyping, false dichotomies.
@@ -17,6 +18,7 @@ Definitions:
 
 Output rules:
 - bias_score: integer 0–10 (0 = neutral, 10 = heavily biased).
+- summary: 2 concise neutral sentences summarizing the provided text.
 - highlights: array of strings, each must be an exact phrase from the input (max 12 items).
 - explanation: 3–7 bullet points (as a single string) focused on *why* it seems biased.
 - missing_perspectives: 3–6 bullet points (as a single string) describing what viewpoints, data, or sources are missing.
@@ -26,6 +28,7 @@ Output rules:
 JSON Schema (exact keys):
 {
   "bias_score": <int 0-10>,
+  "summary": "<string>",
   "highlights": [<string>, ...],
   "explanation": "<string>",
   "missing_perspectives": "<string>"
@@ -46,6 +49,10 @@ bias_schema = [{
                 "maximum": 10,
                 "description": "Bias score from 0 (neutral) to 10 (heavily biased)"
             },
+            "summary": {
+                "type": "string",
+                "description": "Two concise neutral sentences summarizing the input text"
+            },
             "highlights": {
                 "type": "array",
                 "items": {
@@ -65,6 +72,7 @@ bias_schema = [{
         },
         "required": [
             "bias_score",
+            "summary",
             "highlights",
             "explanation",
             "missing_perspectives"
