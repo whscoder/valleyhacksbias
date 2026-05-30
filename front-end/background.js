@@ -84,11 +84,15 @@ async function saveAnalysisState(key, patch) {
   return next;
 }
 
-async function readJson(response) {
+async function readResponseBody(response) {
   try {
-    return await response.json();
+    return { json: await response.clone().json(), text: "" };
   } catch {
-    return {};
+    try {
+      return { json: {}, text: await response.text() };
+    } catch {
+      return { json: {}, text: "" };
+    }
   }
 }
 
@@ -98,9 +102,10 @@ async function postBackend(endpoint, payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
   });
-  const data = await readJson(response);
+  const { json: data, text } = await readResponseBody(response);
   if (!response.ok) {
-    throw new Error(normalizeText(data.detail, `${endpoint} failed.`));
+    const detail = data.detail || data.error || data.message || text;
+    throw new Error(normalizeText(detail, `${endpoint} failed with HTTP ${response.status}.`));
   }
   return data;
 }
@@ -193,7 +198,10 @@ async function runAnalysisJob({ key, url, tabId }) {
     url,
     tabId,
     startedAt: Date.now(),
+    completedAt: null,
     error: "",
+    researchError: "",
+    partialResult: null,
     result: null
   });
 
