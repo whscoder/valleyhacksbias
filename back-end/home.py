@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from openai import AsyncOpenAI
 from pydantic import BaseModel, HttpUrl
 
@@ -518,10 +518,22 @@ async def root():
     return build_health_response()
 
 
+@app.head("/")
+async def root_head():
+    """Allow uptime monitors that use HEAD instead of GET."""
+    return Response(status_code=200)
+
+
 @app.get("/health")
 async def health_check():
     """Cheap wake/liveness endpoint for Render and extension warm-up pings."""
     return build_health_response()
+
+
+@app.head("/health")
+async def health_check_head():
+    """Allow uptime monitors that use HEAD instead of GET."""
+    return Response(status_code=200)
 
 
 @app.post("/extract")
