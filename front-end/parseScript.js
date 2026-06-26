@@ -115,15 +115,73 @@ function toWords(value) {
     .filter((word) => word.length > 2);
 }
 
-// Picks the best explanation bullet for a highlighted phrase using word overlap.
+function shortenPhrase(value, maxChars = 34) {
+  return shortenText(value, maxChars).replace(/\.$/, "");
+}
+
+function phraseSignal(phrase) {
+  const text = String(phrase ?? "").toLowerCase();
+  const words = new Set(toWords(text));
+
+  const hasAny = (terms) => terms.some((term) => words.has(term) || text.includes(term));
+
+  if (/[!?]{2,}/.test(text) || hasAny(["shocking", "outrage", "outrageous", "disaster", "crisis"])) {
+    return {
+      label: "Emotional wording",
+      effect: "pushes a reaction before evidence"
+    };
+  }
+
+  if (hasAny(["always", "never", "everyone", "nobody", "clearly", "obviously", "undeniable"])) {
+    return {
+      label: "Overstated certainty",
+      effect: "makes the claim sound settled"
+    };
+  }
+
+  if (hasAny(["radical", "corrupt", "evil", "traitor", "liar", "crooked", "fake"])) {
+    return {
+      label: "Loaded label",
+      effect: "judges the subject instead of describing it"
+    };
+  }
+
+  if (hasAny(["they", "them", "those people", "elites", "mainstream media"])) {
+    return {
+      label: "Us-vs-them framing",
+      effect: "groups people into sides"
+    };
+  }
+
+  if (hasAny(["must", "now", "urgent", "immediately", "threat", "danger"])) {
+    return {
+      label: "Urgency framing",
+      effect: "pressures the reader to agree quickly"
+    };
+  }
+
+  return {
+    label: "Biased phrasing",
+    effect: "adds tone beyond the facts"
+  };
+}
+
+function buildHighlightTooltip(phrase, context = "") {
+  const signal = phraseSignal(phrase);
+  const quotedPhrase = `"${shortenPhrase(phrase)}"`;
+  const contextHint = context ? ` Context: ${shortenText(context, 58)}` : "";
+  return shortenText(`${signal.label}: ${quotedPhrase} ${signal.effect}.${contextHint}`, 118);
+}
+
+// Picks a compact, phrase-specific explanation for a highlighted phrase.
 function pickReasonForHighlight(phrase, reasonCandidates) {
   const phraseWords = new Set(toWords(phrase));
   if (!phraseWords.size || reasonCandidates.length === 0) {
-    return "This phrasing may steer the reader emotionally instead of neutrally.";
+    return buildHighlightTooltip(phrase);
   }
 
   let bestReason = "";
-  let bestScore = -1;
+  let bestScore = 0;
   for (const candidate of reasonCandidates) {
     const words = toWords(candidate);
     if (!words.length) {
@@ -143,11 +201,11 @@ function pickReasonForHighlight(phrase, reasonCandidates) {
     }
   }
 
-  if (!bestReason) {
-    return "This phrasing may steer the reader emotionally instead of neutrally.";
+  if (bestScore > 0 && bestReason) {
+    return buildHighlightTooltip(phrase, bestReason);
   }
 
-  return bestReason;
+  return buildHighlightTooltip(phrase);
 }
 
 function canScriptActivePage(tabId) {
