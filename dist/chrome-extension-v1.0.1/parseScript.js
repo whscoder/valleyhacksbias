@@ -129,133 +129,6 @@ function normalizeHighlightReasonMap(highlightReasons) {
   return reasonMap;
 }
 
-// Normalizes text into searchable words for simple phrase/reason matching.
-function toWords(value) {
-  return String(value ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter((word) => word.length > 2);
-}
-
-function shortenPhrase(value, maxChars = 34) {
-  return shortenText(value, maxChars).replace(/\.$/, "");
-}
-
-function phraseSignal(phrase) {
-  const text = String(phrase ?? "").toLowerCase();
-  const words = new Set(toWords(text));
-
-  const hasAny = (terms) => terms.some((term) => words.has(term) || text.includes(term));
-
-  if (/[!?]{2,}/.test(text) || hasAny(["shocking", "outrage", "outrageous", "disaster", "crisis"])) {
-    return {
-      label: "Emotional wording",
-      effect: "pushes a reaction before evidence",
-      readerEffect: "It can make the reader feel alarmed or angry before the facts are weighed.",
-      neutralCue: "A neutral version would describe the event or claim without trying to intensify the mood."
-    };
-  }
-
-  if (hasAny(["always", "never", "everyone", "nobody", "clearly", "obviously", "undeniable"])) {
-    return {
-      label: "Overstated certainty",
-      effect: "makes the claim sound settled",
-      readerEffect: "It reduces room for uncertainty, exceptions, or missing evidence.",
-      neutralCue: "A neutral version would qualify the claim or show what evidence supports it."
-    };
-  }
-
-  if (hasAny(["radical", "corrupt", "evil", "traitor", "liar", "crooked", "fake"])) {
-    return {
-      label: "Loaded label",
-      effect: "judges the subject instead of describing it",
-      readerEffect: "It nudges the reader toward a negative judgment before explaining the underlying facts.",
-      neutralCue: "A neutral version would name the specific action, evidence, or allegation."
-    };
-  }
-
-  if (hasAny(["they", "them", "those people", "elites", "mainstream media"])) {
-    return {
-      label: "Us-vs-them framing",
-      effect: "groups people into sides",
-      readerEffect: "It can make a group seem suspicious or opposed to the reader without enough detail.",
-      neutralCue: "A neutral version would identify the specific people or institutions involved."
-    };
-  }
-
-  if (hasAny(["must", "now", "urgent", "immediately", "threat", "danger"])) {
-    return {
-      label: "Urgency framing",
-      effect: "pressures the reader to agree quickly",
-      readerEffect: "It can make the issue feel more immediate or threatening than the evidence alone shows.",
-      neutralCue: "A neutral version would explain the timeline and stakes directly."
-    };
-  }
-
-  return {
-    label: "Biased phrasing",
-    effect: "adds tone beyond the facts",
-    readerEffect: "It may guide the reader toward a feeling or conclusion instead of staying descriptive.",
-    neutralCue: "A neutral version would use more specific, evidence-based wording."
-  };
-}
-
-function contextSentence(context) {
-  const cleanContext = shortenText(context, 120);
-  if (!cleanContext) {
-    return "This is why the phrase was flagged instead of treated as a neutral keyword.";
-  }
-  return `In context, the model also noted: ${cleanContext}`;
-}
-
-function buildHighlightTooltip(phrase, context = "") {
-  const signal = phraseSignal(phrase);
-  const quotedPhrase = `"${shortenPhrase(phrase)}"`;
-  return [
-    `${quotedPhrase} is flagged for ${signal.label.toLowerCase()}.`,
-    `It ${signal.effect}, which can make the sentence feel less neutral.`,
-    signal.readerEffect,
-    signal.neutralCue,
-    contextSentence(context)
-  ].join(" ");
-}
-
-// Picks a phrase-specific explanation for a highlighted phrase.
-function pickReasonForHighlight(phrase, reasonCandidates) {
-  const phraseWords = new Set(toWords(phrase));
-  if (!phraseWords.size || reasonCandidates.length === 0) {
-    return buildHighlightTooltip(phrase);
-  }
-
-  let bestReason = "";
-  let bestScore = 0;
-  for (const candidate of reasonCandidates) {
-    const words = toWords(candidate);
-    if (!words.length) {
-      continue;
-    }
-
-    let overlap = 0;
-    for (const word of words) {
-      if (phraseWords.has(word)) {
-        overlap += 1;
-      }
-    }
-
-    if (overlap > bestScore) {
-      bestScore = overlap;
-      bestReason = candidate;
-    }
-  }
-
-  if (bestScore > 0 && bestReason) {
-    return buildHighlightTooltip(phrase, bestReason);
-  }
-
-  return buildHighlightTooltip(phrase);
-}
-
 function canScriptActivePage(tabId) {
   return (
     Number.isInteger(tabId) &&
@@ -525,12 +398,11 @@ function renderBiasHighlights(highlights, explanation, highlightReasons = [], op
     return wrap;
   }
 
-  const reasonCandidates = parseBulletLikeText(explanation);
   const aiReasonByPhrase = normalizeHighlightReasonMap(highlightReasons);
 
   for (const phrase of highlights) {
     const reason = aiReasonByPhrase.get(String(phrase).trim().toLowerCase()) ||
-      pickReasonForHighlight(phrase, reasonCandidates);
+      "No AI-generated reason is available for this cached result. Run the analysis again to generate specific keyword reasoning.";
 
     const chip = document.createElement("button");
     chip.type = "button";

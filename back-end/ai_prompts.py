@@ -13,6 +13,13 @@ Goals:
 5) Keep the output grounded ONLY in the provided text. Do not invent facts.
 6) For every highlighted phrase, write a distinct phrase-specific reason.
 
+Required internal process:
+Step 1 — Read the article and identify only the strongest biased phrases.
+Step 2 — Put those exact copied phrases in highlights, in article order.
+Step 3 — For each highlight, write highlight_reasons in the same order.
+Step 4 — Before final JSON, compare all highlight_reasons to each other. If two reasons could apply to any highlighted phrase by swapping only the phrase text, rewrite them.
+Step 5 — Write the overall explanation separately. Do not reuse it as a keyword reason.
+
 Definitions:
 - "Bias" includes: loaded language, emotional framing, one-sided sourcing, unsupported certainty, cherry-picking, omission of context, ad hominem, stereotyping, false dichotomies.
 - "Highlights" are exact short phrases copied from the input that triggered the bias flag.
@@ -26,8 +33,12 @@ Output rules:
   - reason: 3–5 complete sentences, 220–420 characters total.
   - reason must be specific to that exact phrase, not a reusable template.
   - Do NOT only swap the phrase into the same wording. Each reason must explain the phrase's particular wording, tone, context, and reader effect.
+  - Mention the phrase's own word choice. For example, explain what makes "disaster" different from "clearly" or "they".
+  - Tie the reason to nearby article context, not just a generic bias category.
   - Each reason must fit inside the 420-character limit. If you need to be shorter, use fewer words, not fewer than 3 sentences.
   - Do not repeat the same opening sentence for multiple highlight reasons.
+  - Bad: '"<phrase>" is flagged because it uses biased wording. It affects neutrality. A neutral version would be more balanced.'
+  - Good: '"Disaster" turns a policy result into a dramatic failure before evidence is weighed. The word pushes readers toward alarm, not evaluation. In this sentence, it frames the actor as incompetent rather than explaining what specifically went wrong.'
 - explanation: exactly 3 bullet points (as a single string) focused on *why the article overall seems biased*.
   - Each bullet must be one complete sentence.
   - Total explanation length must be 260–520 characters.

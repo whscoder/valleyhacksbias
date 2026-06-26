@@ -5,13 +5,31 @@ import {
   researchText
 } from "./backendClient.js";
 
-const ANALYSIS_PREFIX = "factgpt:analysis:";
-const LATEST_KEY = "factgpt:latestAnalysisKey";
+const LEGACY_ANALYSIS_PREFIXES = ["factgpt:analysis:"];
+const ANALYSIS_PREFIX = "factgpt:v2:analysis:";
+const LATEST_KEY = "factgpt:v2:latestAnalysisKey";
+const LEGACY_LATEST_KEYS = ["factgpt:latestAnalysisKey"];
 const MIN_TEXT_CHARS = 200;
 
 // In-memory dedupe for the current service-worker lifetime. The durable copy
 // of progress/results lives in chrome.storage.local below.
 const runningJobs = new Map();
+
+async function purgeLegacyAnalysisCache() {
+  const allData = await chrome.storage.local.get(null);
+  const keysToRemove = Object.keys(allData).filter((key) => (
+    LEGACY_LATEST_KEYS.includes(key) ||
+    LEGACY_ANALYSIS_PREFIXES.some((prefix) => key.startsWith(prefix))
+  ));
+
+  if (keysToRemove.length) {
+    await chrome.storage.local.remove(keysToRemove);
+  }
+}
+
+purgeLegacyAnalysisCache().catch((error) => {
+  console.debug("Legacy analysis cache cleanup skipped:", normalizeText(error.message, "cleanup failed"));
+});
 
 function normalizeText(value, fallback = "") {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
