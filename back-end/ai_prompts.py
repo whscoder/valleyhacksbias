@@ -45,7 +45,12 @@ Output rules:
   - Stay inside this boundary: do not exceed 520 characters, do not end mid-sentence, and do not use ellipses.
   - Preserve depth by covering three different angles when possible: language/tone, sourcing/framing, and missing context.
   - Keep it concise to reduce output tokens.
-- missing_perspectives: 3–6 bullet points (as a single string) describing what viewpoints, data, or sources are missing.
+- missing_perspectives: exactly 3 bullet points (as a single string) describing what viewpoints, data, or sources are missing.
+  - Each bullet must be one complete sentence.
+  - Total missing_perspectives length must be 240–520 characters.
+  - Stay inside this boundary: do not exceed 520 characters, do not end mid-sentence, and do not use ellipses.
+  - Preserve depth by naming concrete missing voices, evidence, data, or context rather than vague phrases like "more perspectives".
+  - Keep it concise to reduce output tokens.
 - If the text is too short or unclear, set bias_score low and explain uncertainty.
 - Highlights must be copied verbatim from the input text. Do not paraphrase.
 
@@ -125,8 +130,9 @@ bias_schema = [{
             },
             "missing_perspectives": {
                 "type": "string",
-                "maxLength": 900,
-                "description": "Missing perspectives in the text"
+                "minLength": 240,
+                "maxLength": 520,
+                "description": "Exactly 3 complete bullet-point sentences describing concrete missing perspectives, evidence, or context"
             }
         },
         "required": [

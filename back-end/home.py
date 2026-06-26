@@ -197,7 +197,7 @@ class AIresultBias(BaseModel):
     highlights: list[str] = Field(default_factory=list, max_length=8)
     highlight_reasons: list[BiasHighlightReason] = Field(default_factory=list, max_length=8)
     explanation: str = Field(..., min_length=260, max_length=520)
-    missing_perspectives: str = Field(..., max_length=900)
+    missing_perspectives: str = Field(..., min_length=240, max_length=520)
 
     @model_validator(mode="after")
     def validate_highlight_reasons(self):

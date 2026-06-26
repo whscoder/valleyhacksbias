@@ -480,7 +480,7 @@ export function renderResult(outputArea, ai, options = {}) {
   const highlights = normalizeHighlights(ai.highlights);
   const highlightsWrap = renderBiasHighlights(highlights, ai.explanation, ai.highlight_reasons, options);
 
-  const missing = createSimplifiedCopy("Missing Perspectives", ai.missing_perspectives, 2, 130);
+  const missing = createCompleteBulletCopy("Missing Perspectives", ai.missing_perspectives);
 
   card.append(metric, summary, explanation, highlightsHeader, highlightsWrap, missing);
   outputArea.appendChild(card);
