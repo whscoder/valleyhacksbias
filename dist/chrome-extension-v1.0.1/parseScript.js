@@ -128,52 +128,77 @@ function phraseSignal(phrase) {
   if (/[!?]{2,}/.test(text) || hasAny(["shocking", "outrage", "outrageous", "disaster", "crisis"])) {
     return {
       label: "Emotional wording",
-      effect: "pushes a reaction before evidence"
+      effect: "pushes a reaction before evidence",
+      readerEffect: "It can make the reader feel alarmed or angry before the facts are weighed.",
+      neutralCue: "A neutral version would describe the event or claim without trying to intensify the mood."
     };
   }
 
   if (hasAny(["always", "never", "everyone", "nobody", "clearly", "obviously", "undeniable"])) {
     return {
       label: "Overstated certainty",
-      effect: "makes the claim sound settled"
+      effect: "makes the claim sound settled",
+      readerEffect: "It reduces room for uncertainty, exceptions, or missing evidence.",
+      neutralCue: "A neutral version would qualify the claim or show what evidence supports it."
     };
   }
 
   if (hasAny(["radical", "corrupt", "evil", "traitor", "liar", "crooked", "fake"])) {
     return {
       label: "Loaded label",
-      effect: "judges the subject instead of describing it"
+      effect: "judges the subject instead of describing it",
+      readerEffect: "It nudges the reader toward a negative judgment before explaining the underlying facts.",
+      neutralCue: "A neutral version would name the specific action, evidence, or allegation."
     };
   }
 
   if (hasAny(["they", "them", "those people", "elites", "mainstream media"])) {
     return {
       label: "Us-vs-them framing",
-      effect: "groups people into sides"
+      effect: "groups people into sides",
+      readerEffect: "It can make a group seem suspicious or opposed to the reader without enough detail.",
+      neutralCue: "A neutral version would identify the specific people or institutions involved."
     };
   }
 
   if (hasAny(["must", "now", "urgent", "immediately", "threat", "danger"])) {
     return {
       label: "Urgency framing",
-      effect: "pressures the reader to agree quickly"
+      effect: "pressures the reader to agree quickly",
+      readerEffect: "It can make the issue feel more immediate or threatening than the evidence alone shows.",
+      neutralCue: "A neutral version would explain the timeline and stakes directly."
     };
   }
 
   return {
     label: "Biased phrasing",
-    effect: "adds tone beyond the facts"
+    effect: "adds tone beyond the facts",
+    readerEffect: "It may guide the reader toward a feeling or conclusion instead of staying descriptive.",
+    neutralCue: "A neutral version would use more specific, evidence-based wording."
   };
+}
+
+function contextSentence(context) {
+  const cleanContext = shortenText(context, 120);
+  if (!cleanContext) {
+    return "This is why the phrase was flagged instead of treated as a neutral keyword.";
+  }
+  return `In context, the model also noted: ${cleanContext}`;
 }
 
 function buildHighlightTooltip(phrase, context = "") {
   const signal = phraseSignal(phrase);
   const quotedPhrase = `"${shortenPhrase(phrase)}"`;
-  const contextHint = context ? ` Context: ${shortenText(context, 58)}` : "";
-  return shortenText(`${signal.label}: ${quotedPhrase} ${signal.effect}.${contextHint}`, 118);
+  return [
+    `${quotedPhrase} is flagged for ${signal.label.toLowerCase()}.`,
+    `It ${signal.effect}, which can make the sentence feel less neutral.`,
+    signal.readerEffect,
+    signal.neutralCue,
+    contextSentence(context)
+  ].join(" ");
 }
 
-// Picks a compact, phrase-specific explanation for a highlighted phrase.
+// Picks a phrase-specific explanation for a highlighted phrase.
 function pickReasonForHighlight(phrase, reasonCandidates) {
   const phraseWords = new Set(toWords(phrase));
   if (!phraseWords.size || reasonCandidates.length === 0) {
