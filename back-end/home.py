@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from openai import AsyncOpenAI
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, model_validator
 
 from ai_prompts import bias_detector_prompt, bias_schema, research_schema, researcher_prompt
 
@@ -184,13 +184,28 @@ class AnalyzeRequest(BaseModel):
     title: str = Field(default="Article Analysis", max_length=200)
 
 
+class BiasHighlightReason(BaseModel):
+    """Phrase-specific reason for a single bias highlight."""
+    phrase: str = Field(..., min_length=1, max_length=140)
+    reason: str = Field(..., min_length=180, max_length=420)
+
+
 class AIresultBias(BaseModel):
     """Normalized bias-analysis response returned to the frontend."""
     bias_score: int
-    summary: str
-    highlights: list[str]
-    explanation: str
-    missing_perspectives: str
+    summary: str = Field(..., max_length=700)
+    highlights: list[str] = Field(default_factory=list, max_length=8)
+    highlight_reasons: list[BiasHighlightReason] = Field(default_factory=list, max_length=8)
+    explanation: str = Field(..., min_length=260, max_length=520)
+    missing_perspectives: str = Field(..., max_length=900)
+
+    @model_validator(mode="after")
+    def validate_highlight_reasons(self):
+        highlights = [highlight.strip() for highlight in self.highlights]
+        reason_phrases = [item.phrase.strip() for item in self.highlight_reasons]
+        if reason_phrases != highlights:
+            raise ValueError("highlight_reasons must match highlights exactly and in order.")
+        return self
 
 
 class ResearchSource(BaseModel):
@@ -405,7 +420,7 @@ async def analyze_bias(text: str) -> dict:
             payload=payload,
             schema_name="bias_result",
             schema=bias_schema[0]["parameters"],
-            max_tokens=1000,
+            max_tokens=1800,
             temperature=0.2,
         )
         return parse_model_json(response)

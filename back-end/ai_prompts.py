@@ -11,6 +11,7 @@ Goals:
 3) Explain why it is biased in a neutral, educational tone.
 4) Suggest missing perspectives (who/what is not represented).
 5) Keep the output grounded ONLY in the provided text. Do not invent facts.
+6) For every highlighted phrase, write a distinct phrase-specific reason.
 
 Definitions:
 - "Bias" includes: loaded language, emotional framing, one-sided sourcing, unsupported certainty, cherry-picking, omission of context, ad hominem, stereotyping, false dichotomies.
@@ -19,8 +20,20 @@ Definitions:
 Output rules:
 - bias_score: integer 0–10 (0 = neutral, 10 = heavily biased).
 - summary: 2 concise neutral sentences summarizing the provided text.
-- highlights: array of strings, each must be an exact phrase from the input (max 12 items).
-- explanation: 3–7 bullet points (as a single string) focused on *why* it seems biased.
+- highlights: array of strings, each must be an exact phrase from the input (max 8 items).
+- highlight_reasons: array of objects, one for each highlight, in the same order as highlights.
+  - phrase: must exactly match one string in highlights.
+  - reason: 3–5 complete sentences, 220–420 characters total.
+  - reason must be specific to that exact phrase, not a reusable template.
+  - Do NOT only swap the phrase into the same wording. Each reason must explain the phrase's particular wording, tone, context, and reader effect.
+  - Each reason must fit inside the 420-character limit. If you need to be shorter, use fewer words, not fewer than 3 sentences.
+  - Do not repeat the same opening sentence for multiple highlight reasons.
+- explanation: exactly 3 bullet points (as a single string) focused on *why the article overall seems biased*.
+  - Each bullet must be one complete sentence.
+  - Total explanation length must be 260–520 characters.
+  - Stay inside this boundary: do not exceed 520 characters, do not end mid-sentence, and do not use ellipses.
+  - Preserve depth by covering three different angles when possible: language/tone, sourcing/framing, and missing context.
+  - Keep it concise to reduce output tokens.
 - missing_perspectives: 3–6 bullet points (as a single string) describing what viewpoints, data, or sources are missing.
 - If the text is too short or unclear, set bias_score low and explain uncertainty.
 - Highlights must be copied verbatim from the input text. Do not paraphrase.
@@ -30,6 +43,9 @@ JSON Schema (exact keys):
   "bias_score": <int 0-10>,
   "summary": "<string>",
   "highlights": [<string>, ...],
+  "highlight_reasons": [
+    {"phrase": "<exact highlight phrase>", "reason": "<3-5 distinct bounded sentences>"}
+  ],
   "explanation": "<string>",
   "missing_perspectives": "<string>"
 }
@@ -56,17 +72,49 @@ bias_schema = [{
             "highlights": {
                 "type": "array",
                 "items": {
-                    "type": "string"
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 140
                 },
-                "maxItems": 12,
+                "maxItems": 8,
                 "description": "Exact phrases from the input text that triggered bias flags"
+            },
+            "highlight_reasons": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "phrase": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 140,
+                            "description": "Exact phrase from highlights"
+                        },
+                        "reason": {
+                            "type": "string",
+                            "minLength": 180,
+                            "maxLength": 420,
+                            "description": "Distinct 3-5 sentence explanation for why this exact phrase is biased"
+                        }
+                    },
+                    "required": [
+                        "phrase",
+                        "reason"
+                    ],
+                    "additionalProperties": False
+                },
+                "maxItems": 8,
+                "description": "One distinct bounded explanation per highlighted phrase, in highlight order"
             },
             "explanation": {
                 "type": "string",
-                "description": "Explanation of why the text is biased"
+                "minLength": 260,
+                "maxLength": 520,
+                "description": "Exactly 3 complete bullet-point sentences explaining why the article overall seems biased"
             },
             "missing_perspectives": {
                 "type": "string",
+                "maxLength": 900,
                 "description": "Missing perspectives in the text"
             }
         },
@@ -74,6 +122,7 @@ bias_schema = [{
             "bias_score",
             "summary",
             "highlights",
+            "highlight_reasons",
             "explanation",
             "missing_perspectives"
         ],

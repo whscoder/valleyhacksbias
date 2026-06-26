@@ -106,6 +106,29 @@ export function normalizeHighlights(highlights) {
   return normalized;
 }
 
+function normalizeHighlightReasonMap(highlightReasons) {
+  const reasonMap = new Map();
+  if (!Array.isArray(highlightReasons)) {
+    return reasonMap;
+  }
+
+  for (const entry of highlightReasons) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+
+    const phrase = String(entry.phrase ?? "").trim();
+    const reason = normalizeText(entry.reason, "");
+    if (!phrase || !reason) {
+      continue;
+    }
+
+    reasonMap.set(phrase.toLowerCase(), reason);
+  }
+
+  return reasonMap;
+}
+
 // Normalizes text into searchable words for simple phrase/reason matching.
 function toWords(value) {
   return String(value ?? "")
@@ -490,7 +513,7 @@ export function setOutputMessage(outputArea, message, isError = false) {
 }
 
 // Renders highlight chips and attaches tooltip reasons for each phrase.
-function renderBiasHighlights(highlights, explanation, options = {}) {
+function renderBiasHighlights(highlights, explanation, highlightReasons = [], options = {}) {
   const wrap = document.createElement("div");
   wrap.className = "bias-chip-grid";
 
@@ -503,9 +526,11 @@ function renderBiasHighlights(highlights, explanation, options = {}) {
   }
 
   const reasonCandidates = parseBulletLikeText(explanation);
+  const aiReasonByPhrase = normalizeHighlightReasonMap(highlightReasons);
 
   for (const phrase of highlights) {
-    const reason = pickReasonForHighlight(phrase, reasonCandidates);
+    const reason = aiReasonByPhrase.get(String(phrase).trim().toLowerCase()) ||
+      pickReasonForHighlight(phrase, reasonCandidates);
 
     const chip = document.createElement("button");
     chip.type = "button";
@@ -547,6 +572,14 @@ function createSimplifiedCopy(label, value, maxItems = 2, maxChars = 140) {
   return createLabeledCopy(label, simplifyBulletText(value, maxItems, maxChars));
 }
 
+function createCompleteBulletCopy(label, value) {
+  const bullets = parseBulletLikeText(value);
+  if (!bullets.length) {
+    return createLabeledCopy(label, value);
+  }
+  return createLabeledCopy(label, bullets.join(" • "));
+}
+
 // Renders the bias-analysis card returned by the backend.
 export function renderResult(outputArea, ai, options = {}) {
   outputArea.innerHTML = "";
@@ -564,7 +597,7 @@ export function renderResult(outputArea, ai, options = {}) {
   metric.append(metricLabel, scorePill);
 
   const summary = createLabeledCopy("Quick Summary", ai.summary);
-  const explanation = createSimplifiedCopy("Explanation", ai.explanation, 2, 135);
+  const explanation = createCompleteBulletCopy("Explanation", ai.explanation);
 
   const highlightsHeader = document.createElement("p");
   highlightsHeader.className = "copy-block";
@@ -573,7 +606,7 @@ export function renderResult(outputArea, ai, options = {}) {
   highlightsHeader.append(highlightsLabel, document.createTextNode(": click to find on page"));
 
   const highlights = normalizeHighlights(ai.highlights);
-  const highlightsWrap = renderBiasHighlights(highlights, ai.explanation, options);
+  const highlightsWrap = renderBiasHighlights(highlights, ai.explanation, ai.highlight_reasons, options);
 
   const missing = createSimplifiedCopy("Missing Perspectives", ai.missing_perspectives, 2, 130);
 
