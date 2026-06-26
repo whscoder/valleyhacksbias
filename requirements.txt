@@ -1,8 +1,8 @@
-fastapi
-uvicorn
-httpx
-beautifulsoup4
-openai
-playwright
-python-dotenv
-pydantic
+fastapi==0.128.0
+uvicorn==0.40.0
+httpx==0.28.1
+beautifulsoup4==4.14.3
+openai==2.15.0
+playwright==1.60.0
+python-dotenv==1.2.1
+pydantic==2.12.5

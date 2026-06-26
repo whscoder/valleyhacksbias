@@ -1,12 +1,15 @@
 import asyncio
 from collections import defaultdict, deque
+import hmac
 import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import time
 from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 import uvicorn
@@ -16,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from openai import AsyncOpenAI
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 
 from ai_prompts import bias_detector_prompt, bias_schema, research_schema, researcher_prompt
 
@@ -27,20 +30,47 @@ except Exception:
     async_playwright = None
 
 
+def parse_env_bool(value: str | None) -> bool:
+    """Parse common truthy environment variable values."""
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 # Centralized runtime settings keep thresholds easy to tune.
 MODEL_NAME = "gpt-4o-mini"
 MIN_EXTRACT_CHARS = 200
 MAX_RESEARCH_INPUT_CHARS = 6000
 MAX_ANALYSIS_INPUT_CHARS = 12000
+MAX_REQUEST_TEXT_CHARS = int(os.getenv("FACTGPT_MAX_REQUEST_TEXT_CHARS", "50000"))
+MAX_REQUEST_BODY_BYTES = int(os.getenv("FACTGPT_MAX_REQUEST_BODY_BYTES", "200000"))
+MAX_FETCH_BYTES = int(os.getenv("FACTGPT_MAX_FETCH_BYTES", "1000000"))
+MAX_EXTRACTED_TEXT_CHARS = int(os.getenv("FACTGPT_MAX_EXTRACTED_TEXT_CHARS", str(MAX_ANALYSIS_INPUT_CHARS)))
+MAX_REDIRECTS = int(os.getenv("FACTGPT_MAX_REDIRECTS", "5"))
 HTTP_CONNECT_TIMEOUT_SECONDS = 10
 HTTP_READ_TIMEOUT_SECONDS = 15
 BROWSER_TIMEOUT_MS = 30000
-DEFAULT_ALLOWED_ORIGIN_REGEX = r"^chrome-extension://[a-z]{32}$|^http://(127\.0\.0\.1|localhost)(:\d+)?$"
+DEFAULT_ALLOWED_ORIGIN_REGEX = r"^http://(127\.0\.0\.1|localhost)(:\d+)?$"
 BLOCKED_HOSTNAMES = {"localhost", "localhost.localdomain"}
 RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_REQUESTS = int(os.getenv("FACTGPT_RATE_LIMIT_PER_MINUTE", "45"))
+PROTECTED_PATHS = {"/analyze", "/analyze-bias", "/research", "/extract", "/extract-rendered"}
 SERVICE_NAME = "factgpt-backend"
 COLD_START_WINDOW_SECONDS = 120
+PUBLIC_API_TOKEN = os.getenv("FACTGPT_PUBLIC_API_TOKEN", "").strip()
+REQUIRE_API_TOKEN = parse_env_bool(os.getenv("FACTGPT_REQUIRE_API_TOKEN")) or bool(PUBLIC_API_TOKEN)
+REQUIRE_ALLOWED_ORIGIN = parse_env_bool(os.getenv("FACTGPT_REQUIRE_ALLOWED_ORIGIN"))
+TRUST_X_FORWARDED_FOR = parse_env_bool(os.getenv("FACTGPT_TRUST_X_FORWARDED_FOR"))
+TRUSTED_PROXY_IPS = {
+    ip.strip()
+    for ip in os.getenv("FACTGPT_TRUSTED_PROXY_IPS", "").split(",")
+    if ip.strip()
+}
+ALLOWED_ORIGINS = {
+    origin.strip()
+    for origin in os.getenv("FACTGPT_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+}
+ALLOWED_ORIGIN_REGEX = os.getenv("FACTGPT_ALLOWED_ORIGIN_REGEX", DEFAULT_ALLOWED_ORIGIN_REGEX)
+ALLOWED_ORIGIN_PATTERN = re.compile(ALLOWED_ORIGIN_REGEX) if ALLOWED_ORIGIN_REGEX else None
 # Health probes may run on every popup open, so they stay cheap and unmetered.
 HEALTHCHECK_PATHS = {"/", "/health"}
 STARTED_AT_UNIX = time.time()
@@ -56,6 +86,8 @@ load_dotenv(Path(__file__).resolve().parent / "data" / "apikey.env")
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     raise RuntimeError("Missing OPENAI_API_KEY. Set it in environment or back-end/data/apikey.env.")
+if REQUIRE_API_TOKEN and not PUBLIC_API_TOKEN:
+    raise RuntimeError("FACTGPT_REQUIRE_API_TOKEN is true, but FACTGPT_PUBLIC_API_TOKEN is not set.")
 
 # Shared async OpenAI client for all endpoints.
 client = AsyncOpenAI(api_key=api_key)
@@ -63,26 +95,73 @@ client = AsyncOpenAI(api_key=api_key)
 # Allow the browser extension UI to call this local backend.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        origin.strip()
-        for origin in os.getenv("FACTGPT_ALLOWED_ORIGINS", "").split(",")
-        if origin.strip()
-    ],
-    allow_origin_regex=os.getenv("FACTGPT_ALLOWED_ORIGIN_REGEX", DEFAULT_ALLOWED_ORIGIN_REGEX),
+    allow_origins=sorted(ALLOWED_ORIGINS),
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "X-FactGPT-API-Key"],
 )
 
 
+def origin_is_allowed(origin: str) -> bool:
+    """Return whether a browser origin is allowed to use protected routes."""
+    if not origin:
+        return False
+    if origin in ALLOWED_ORIGINS:
+        return True
+    return bool(ALLOWED_ORIGIN_PATTERN and ALLOWED_ORIGIN_PATTERN.fullmatch(origin))
+
+
+def request_api_token(request: Request) -> str:
+    """Read a caller token without assuming a specific client transport."""
+    bearer_prefix = "Bearer "
+    authorization = request.headers.get("authorization", "")
+    if authorization.startswith(bearer_prefix):
+        return authorization[len(bearer_prefix):].strip()
+    return request.headers.get("x-factgpt-api-key", "").strip()
+
+
+def request_has_valid_api_token(request: Request) -> bool:
+    """Validate the optional public API token in constant time."""
+    if not REQUIRE_API_TOKEN:
+        return True
+    return hmac.compare_digest(request_api_token(request), PUBLIC_API_TOKEN)
+
+
+def client_identifier(request: Request) -> str:
+    """Choose a rate-limit key without trusting spoofable proxy headers by default."""
+    peer_host = request.client.host if request.client else ""
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for and (TRUST_X_FORWARDED_FOR or peer_host in TRUSTED_PROXY_IPS):
+        return forwarded_for.split(",", 1)[0].strip() or peer_host or "unknown"
+    return peer_host or "unknown"
+
+
 @app.middleware("http")
-async def rate_limit_requests(request: Request, call_next):
-    """Simple per-client guard for public AI endpoints."""
+async def guard_public_requests(request: Request, call_next):
+    """Apply cheap public-edge checks before model/browser work starts."""
     if request.method == "OPTIONS" or request.url.path in HEALTHCHECK_PATHS:
         return await call_next(request)
 
-    forwarded_for = request.headers.get("x-forwarded-for", "")
-    client_id = forwarded_for.split(",", 1)[0].strip() or (request.client.host if request.client else "unknown")
+    if request.url.path in PROTECTED_PATHS:
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_REQUEST_BODY_BYTES:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"detail": "Request body is too large."},
+                    )
+            except ValueError:
+                return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length header."})
+
+        if REQUIRE_ALLOWED_ORIGIN and not origin_is_allowed(request.headers.get("origin", "")):
+            return JSONResponse(status_code=403, content={"detail": "Origin is not allowed."})
+
+        if not request_has_valid_api_token(request):
+            return JSONResponse(status_code=401, content={"detail": "Missing or invalid API token."})
+
+    client_id = client_identifier(request)
     now = time.monotonic()
     timestamps = request_timestamps_by_client[client_id]
 
@@ -101,8 +180,8 @@ async def rate_limit_requests(request: Request, call_next):
 
 class AnalyzeRequest(BaseModel):
     """Input payload for bias/research endpoints."""
-    text: str
-    title: str = "Article Analysis"
+    text: str = Field(..., max_length=MAX_REQUEST_TEXT_CHARS)
+    title: str = Field(default="Article Analysis", max_length=200)
 
 
 class AIresultBias(BaseModel):
@@ -145,7 +224,7 @@ class LegacyAIresultResearch(BaseModel):
 
 class URLRequest(BaseModel):
     """Input payload for URL extraction endpoint."""
-    url: HttpUrl
+    url: HttpUrl = Field(..., max_length=2048)
 
 
 def build_health_response() -> dict[str, Any]:
@@ -213,6 +292,14 @@ async def validate_public_url(url: str) -> None:
         resolved_ips = {entry[4][0] for entry in addresses}
         if not resolved_ips or any(not is_public_ip(address) for address in resolved_ips):
             raise HTTPException(status_code=400, detail="Private or internal network URLs are not supported.")
+
+
+def cap_extracted_text(text: str) -> str:
+    """Limit text returned to clients to what downstream analysis can use."""
+    clean_text = str(text or "").strip()
+    if len(clean_text) > MAX_EXTRACTED_TEXT_CHARS:
+        return clean_text[:MAX_EXTRACTED_TEXT_CHARS]
+    return clean_text
 
 
 def _load_json_object(candidate: Any) -> dict | None:
@@ -400,7 +487,7 @@ async def extract_text_with_httpx(url: str) -> tuple[str, str]:
     """Try direct HTTP fetch first; return (text, error_reason)."""
     try:
         async with httpx.AsyncClient(
-            follow_redirects=True,
+            follow_redirects=False,
             # Split timeouts so slow servers fail fast and we can try Playwright.
             timeout=httpx.Timeout(
                 connect=HTTP_CONNECT_TIMEOUT_SECONDS,
@@ -410,15 +497,18 @@ async def extract_text_with_httpx(url: str) -> tuple[str, str]:
             ),
             headers={"User-Agent": "Mozilla/5.0"},
         ) as http:
-            response = await http.get(url)
+            response, html = await fetch_html_with_httpx_redirects(http, url)
     except httpx.ReadTimeout:
         return "", "Direct fetch timed out while reading the page."
     except httpx.ConnectTimeout:
         return "", "Direct fetch timed out while connecting to the site."
+    except HTTPException as exc:
+        return "", str(exc.detail)
+    except ValueError as exc:
+        return "", str(exc)
     except httpx.HTTPError as exc:
         return "", f"Network error fetching URL: {exc}"
 
-    html = response.text
     text = extract_readable_text(html)
     # Convert fetch outcomes into one reason string so the caller can report it cleanly.
     if response.status_code >= 400:
@@ -427,7 +517,43 @@ async def extract_text_with_httpx(url: str) -> tuple[str, str]:
         return "", "Direct fetch looked blocked by bot protection."
     if len(text) < MIN_EXTRACT_CHARS:
         return "", f"Direct fetch returned too little readable text ({len(text)} chars)."
-    return text, ""
+    return cap_extracted_text(text), ""
+
+
+async def read_limited_response_bytes(response: httpx.Response) -> bytes:
+    """Read a response body with a hard byte limit."""
+    chunks: list[bytes] = []
+    total_bytes = 0
+    async for chunk in response.aiter_bytes():
+        total_bytes += len(chunk)
+        if total_bytes > MAX_FETCH_BYTES:
+            raise ValueError("Fetched page is too large.")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def fetch_html_with_httpx_redirects(
+    http: httpx.AsyncClient,
+    url: str,
+) -> tuple[httpx.Response, str]:
+    """Fetch HTML while validating every redirect target before following it."""
+    current_url = str(url)
+    for _ in range(MAX_REDIRECTS + 1):
+        await validate_public_url(current_url)
+        async with http.stream("GET", current_url) as response:
+            if response.is_redirect:
+                location = response.headers.get("location")
+                if not location:
+                    raise ValueError("Redirect response did not include a Location header.")
+                current_url = urljoin(str(response.url), location)
+                continue
+
+            body = await read_limited_response_bytes(response)
+            encoding = response.encoding or "utf-8"
+            html = body.decode(encoding, errors="replace")
+            return response, html
+
+    raise ValueError("Too many redirects while fetching URL.")
 
 
 async def fetch_html_with_playwright(url: str) -> str:
@@ -443,15 +569,29 @@ async def fetch_html_with_playwright(url: str) -> str:
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
         )
+        await context.route("**/*", route_public_network_requests)
         page = await context.new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT_MS)
             # Brief wait gives client-side rendered article content time to appear.
             await page.wait_for_timeout(1200)
-            return await page.content()
+            html = await page.content()
+            if len(html.encode("utf-8")) > MAX_FETCH_BYTES:
+                raise RuntimeError("Rendered page is too large.")
+            return html
         finally:
             await context.close()
             await browser.close()
+
+
+async def route_public_network_requests(route, request) -> None:
+    """Block Playwright document/subresource requests to private networks."""
+    try:
+        await validate_public_url(request.url)
+    except Exception:
+        await route.abort()
+        return
+    await route.continue_()
 
 
 def validate_ai_bias(ai: dict) -> AIresultBias:
@@ -560,7 +700,7 @@ async def extract_text_rendered(req: URLRequest):
         rendered_text = extract_readable_text(rendered_html)
         if len(rendered_text) < MIN_EXTRACT_CHARS:
             raise ValueError("Rendered page still produced too little readable text.")
-        return {"status": "extracted", "method": "playwright", "text": rendered_text}
+        return {"status": "extracted", "method": "playwright", "text": cap_extracted_text(rendered_text)}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Playwright extraction failed: {exc}") from exc
 
