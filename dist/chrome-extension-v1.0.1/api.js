@@ -1,3 +1,4 @@
+// Low-level HTTP adapter: tries configured backends and normalizes error bodies.
 import { BACKEND_BASE_URLS } from "./config.js";
 
 function buildBackendUrl(baseUrl, endpoint) {
@@ -18,9 +19,23 @@ async function readResponseBody(response) {
   }
 }
 
+export function formatBackendErrorDetail(value, fallback) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const message = String(value.message ?? fallback ?? "Request failed.").trim();
+    const diagnostics = [
+      value.code ? `Code: ${String(value.code).trim()}` : "",
+      value.reference ? `Reference: ${String(value.reference).trim()}` : ""
+    ].filter(Boolean);
+    return [message, ...diagnostics].join(" ");
+  }
+  return String(value || fallback || "Request failed.").trim();
+}
+
 export async function requestBackend(endpoint, init = {}) {
   let lastError = null;
 
+  // Fail over only when a base URL is unreachable. An HTTP response proves that
+  // the backend was reached, so surface its error instead of retrying elsewhere.
   for (const baseUrl of BACKEND_BASE_URLS) {
     let response;
     try {
@@ -33,7 +48,10 @@ export async function requestBackend(endpoint, init = {}) {
     const { json, text } = await readResponseBody(response);
     if (!response.ok) {
       const detail = json.detail || json.error || json.message || text;
-      throw new Error(String(detail || `Request failed with HTTP ${response.status}.`).trim());
+      throw new Error(formatBackendErrorDetail(
+        detail,
+        `Request failed with HTTP ${response.status}.`
+      ));
     }
     return json;
   }

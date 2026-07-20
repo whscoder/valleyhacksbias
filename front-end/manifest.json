@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Fact GPT",
-  "version": "1.0.3",
-  "description": "Analyzes news articles for bias and misinformation.",
+  "version": "1.1.0",
+  "description": "Analyzes news articles and open-web podcasts for bias and reliability.",
   "action": {
     "default_title": "Fact GPT",
     "default_popup": "extension.html"

@@ -1,4 +1,10 @@
+// Test-only analysis pipeline records extraction metadata for Playwright reports.
 import { BACKEND_BASE_URLS } from "./config.js";
+import {
+  renderFactOpinion as renderProductionFactOpinion,
+  renderResult as renderProductionResult,
+  renderSources as renderProductionSources
+} from "./productionParseScript.js";
 
 const THINKING_DOT_MS = 180;
 
@@ -34,6 +40,16 @@ function normalizeText(value, fallback = "N/A") {
   }
 
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text || fallback;
+}
+
+function normalizeArticleText(value, fallback = "") {
+  const text = String(value ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[^\S\n]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
   return text || fallback;
 }
 
@@ -246,6 +262,108 @@ function renderResult(outputArea, ai) {
   outputArea.appendChild(card);
 }
 
+function factOpinionPresentation(item) {
+  const finalPrediction = item?.final_prediction || {};
+  const excerpts = Array.isArray(finalPrediction.opinion_excerpts)
+    ? finalPrediction.opinion_excerpts.filter((excerpt) => String(excerpt ?? "").length > 0)
+    : [];
+  if (finalPrediction.status !== "resolved") {
+    return { badge: "Unresolved — not analyzed", kind: "unresolved", excerpts: [] };
+  }
+  if (finalPrediction.label === "opinion") {
+    return { badge: "Opinion — ignored during analysis", kind: "opinion", excerpts: [] };
+  }
+  if (finalPrediction.label === "fact" && excerpts.length) {
+    return { badge: "Fact + opinion wording", kind: "mixed", excerpts };
+  }
+  if (finalPrediction.label === "fact") {
+    return { badge: "Fact", kind: "fact", excerpts: [] };
+  }
+  return { badge: "Unresolved — not analyzed", kind: "unresolved", excerpts: [] };
+}
+
+function appendHighlightedOpinionText(container, textValue, excerpts) {
+  const text = String(textValue ?? "");
+  const matches = [];
+  for (const excerptValue of Array.from(new Set(excerpts))) {
+    const excerpt = String(excerptValue ?? "");
+    let fromIndex = 0;
+    while (excerpt && fromIndex < text.length) {
+      const start = text.indexOf(excerpt, fromIndex);
+      if (start === -1) break;
+      matches.push({ start, end: start + excerpt.length });
+      fromIndex = start + excerpt.length;
+    }
+  }
+  matches.sort((left, right) => left.start - right.start || right.end - left.end);
+  let cursor = 0;
+  for (const match of matches) {
+    if (match.start < cursor) continue;
+    if (match.start > cursor) {
+      container.appendChild(document.createTextNode(text.slice(cursor, match.start)));
+    }
+    const mark = document.createElement("mark");
+    mark.className = "opinion-excerpt";
+    mark.textContent = text.slice(match.start, match.end);
+    container.appendChild(mark);
+    cursor = match.end;
+  }
+  if (cursor < text.length || !matches.length) {
+    container.appendChild(document.createTextNode(text.slice(cursor)));
+  }
+}
+
+function renderFactOpinion(outputArea, section, factOpinion) {
+  outputArea.innerHTML = "";
+  const items = Array.isArray(factOpinion?.items) ? factOpinion.items : [];
+  if (!factOpinion || typeof factOpinion !== "object" || !items.length) {
+    section.style.display = "none";
+    return;
+  }
+
+  section.style.display = "block";
+  const counts = factOpinion.counts || {};
+  const countGrid = document.createElement("div");
+  countGrid.className = "fact-opinion-counts";
+  for (const [label, key] of [
+    ["Fact", "fact"],
+    ["Opinion", "opinion"],
+    ["Unresolved", "unresolved"],
+    ["OpenAI reviewed", "openai_reviewed"]
+  ]) {
+    const count = document.createElement("div");
+    count.className = "fact-opinion-count";
+    const strong = document.createElement("strong");
+    strong.textContent = String(Number.isInteger(counts[key]) ? counts[key] : 0);
+    count.append(strong, document.createTextNode(label));
+    countGrid.appendChild(count);
+  }
+
+  const list = document.createElement("ol");
+  list.className = "fact-opinion-list";
+  for (const item of items) {
+    const presentation = factOpinionPresentation(item);
+    const row = document.createElement("li");
+    row.className = `fact-opinion-item fact-opinion-item-${presentation.kind}`;
+    const badge = document.createElement("span");
+    badge.className = `fact-opinion-badge fact-opinion-badge-${presentation.kind}`;
+    badge.textContent = presentation.badge;
+    const text = document.createElement("p");
+    text.className = "fact-opinion-text";
+    appendHighlightedOpinionText(text, item?.text, presentation.excerpts);
+    row.append(badge, text);
+    const explanationValue = String(item?.final_prediction?.explanation ?? "").trim();
+    if (explanationValue) {
+      const explanation = document.createElement("p");
+      explanation.className = "fact-opinion-explanation";
+      explanation.textContent = explanationValue;
+      row.appendChild(explanation);
+    }
+    list.appendChild(row);
+  }
+  outputArea.append(countGrid, list);
+}
+
 // Accepts only http/https URLs for external source links.
 function validUrl(urlValue) {
   try {
@@ -395,12 +513,21 @@ export async function parseText(url, updateStatus = () => {}, options = {}) {
   const skipResearch = options.skipResearch === true;
   const outputArea = document.getElementById("parsed-output_bin");
   const resultsSection = document.getElementById("results-area_extension");
+  const factOpinionSection = document.getElementById("fact-opinion-area_extension");
+  const factOpinionOutput = document.getElementById("fact-opinion-output_bin");
   const sourcesSection = document.getElementById("sources-area_extension");
   const sourcesOutput = document.getElementById("sources-output_bin");
   const thinkingArea = document.getElementById("thinking-area");
   const thinkingText = document.getElementById("thinking-text");
 
-  if (!outputArea || !resultsSection || !sourcesSection || !sourcesOutput) {
+  if (
+    !outputArea ||
+    !resultsSection ||
+    !factOpinionSection ||
+    !factOpinionOutput ||
+    !sourcesSection ||
+    !sourcesOutput
+  ) {
     return { ok: false, error: "Extension UI is missing required containers." };
   }
 
@@ -419,6 +546,8 @@ export async function parseText(url, updateStatus = () => {}, options = {}) {
   };
 
   resultsSection.style.display = "block";
+  factOpinionSection.style.display = "none";
+  factOpinionOutput.innerHTML = "";
   sourcesSection.style.display = "none";
   sourcesOutput.innerHTML = "";
   setOutputMessage(outputArea, "Preparing scan...");
@@ -474,7 +603,7 @@ export async function parseText(url, updateStatus = () => {}, options = {}) {
         );
       }
 
-      finalRawText = normalizeText(extractData.text, "");
+      finalRawText = normalizeArticleText(extractData.text, "");
       metadata.extractMethod = normalizeText(extractData.method, "unknown");
       metadata.extractedTextChars = finalRawText.length;
       metadata.extractedTextPreview = finalRawText.slice(0, 200);
@@ -532,20 +661,26 @@ export async function parseText(url, updateStatus = () => {}, options = {}) {
 
     // Show the bias result immediately even if source-research fails later.
     const aiBiasResult = biasResult.ai_result || {};
+    const factOpinionResult = biasResult.fact_opinion || null;
     metadata.biasScore = Number.isInteger(aiBiasResult.bias_score) ? aiBiasResult.bias_score : null;
     metadata.highlightCount = Array.isArray(aiBiasResult.highlights) ? aiBiasResult.highlights.length : 0;
     metadata.explanationPresent = Boolean(String(aiBiasResult.explanation ?? "").trim());
     metadata.missingPerspectivesPresent = Boolean(String(aiBiasResult.missing_perspectives ?? "").trim());
-    renderResult(outputArea, aiBiasResult);
+    metadata.factOpinionCounts = factOpinionResult?.counts || {};
+    renderProductionResult(outputArea, aiBiasResult, {
+      factOpinion: factOpinionResult
+    });
+    renderProductionFactOpinion(factOpinionOutput, factOpinionSection, factOpinionResult);
 
     if (skipResearch) {
-      renderSources(sourcesOutput, sourcesSection, {});
+      renderProductionSources(sourcesOutput, sourcesSection, {}, factOpinionResult);
       setStatus("Bias-only test complete.");
       return {
         ok: true,
         result: {
           ai_result: aiBiasResult,
-          ai_research: {}
+          ai_research: {},
+          fact_opinion: factOpinionResult
         },
         completionMessage: "Bias-only test complete.",
         metadata
@@ -559,7 +694,9 @@ export async function parseText(url, updateStatus = () => {}, options = {}) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         text: finalRawText,
-        title: "Article Analysis"
+        title: "Article Analysis",
+        ...(factOpinionResult ? { fact_opinion: factOpinionResult } : {}),
+        ...(aiBiasResult ? { bias_result: aiBiasResult } : {})
       })
     });
 
@@ -572,12 +709,16 @@ export async function parseText(url, updateStatus = () => {}, options = {}) {
 
     if (!researchResponse.ok) {
       // Research is optional for UX; return a partial success so bias results still display.
-      renderSources(sourcesOutput, sourcesSection, {});
+      renderProductionSources(sourcesOutput, sourcesSection, {}, factOpinionResult);
       setStatus("Bias complete. Sources unavailable right now.");
       return {
         ok: true,
         partial: true,
-        result: { ai_result: aiBiasResult, ai_research: {} },
+        result: {
+          ai_result: aiBiasResult,
+          ai_research: {},
+          fact_opinion: factOpinionResult
+        },
         researchError: normalizeText(researchResult.detail, "Research failed."),
         metadata: {
           ...metadata,
@@ -588,13 +729,21 @@ export async function parseText(url, updateStatus = () => {}, options = {}) {
     }
 
     const aiResearchResult = researchResult.ai_research || {};
-    renderSources(sourcesOutput, sourcesSection, aiResearchResult);
+    const finalFactOpinion = researchResult.fact_opinion || factOpinionResult;
+    renderProductionFactOpinion(factOpinionOutput, factOpinionSection, finalFactOpinion);
+    renderProductionSources(
+      sourcesOutput,
+      sourcesSection,
+      aiResearchResult,
+      finalFactOpinion
+    );
     setStatus("Analysis complete.");
     return {
       ok: true,
       result: {
         ai_result: aiBiasResult,
-        ai_research: aiResearchResult
+        ai_research: aiResearchResult,
+        fact_opinion: finalFactOpinion
       },
       metadata: {
         ...metadata,

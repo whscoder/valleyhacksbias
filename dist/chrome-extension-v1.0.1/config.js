@@ -1,3 +1,4 @@
+// Central backend-location policy shared by every production extension request.
 function normalizeBaseUrl(value) {
   return String(value ?? "").trim().replace(/\/+$/, "");
 }

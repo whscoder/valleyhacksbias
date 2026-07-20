@@ -1,4 +1,7 @@
+"""Run the extension end to end against a randomized Common Crawl URL batch."""
+
 import json
+import os
 import random
 import shutil
 import tempfile
@@ -27,7 +30,12 @@ REPORTS_DIR = Path(__file__).resolve().parent / "reports"
 # - `CRAWL_URL_POOL_SIZE` controls how many crawled article URLs to collect first.
 # - `TEST_RUN_COUNT` controls how many URLs from that pool get tested this run.
 HEADLESS = True
-BIAS_ONLY_TEST = True
+BIAS_ONLY_TEST = os.getenv("FACTGPT_E2E_BIAS_ONLY", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 CRAWL_URL_POOL_SIZE = 12
 TEST_RUN_COUNT = 12
 CRAWL_INSECURE_TLS = True
@@ -96,6 +104,13 @@ def create_test_extension_bundle(bundle_dir: Path) -> Path:
     # Build a temporary extension directory for Playwright by copying the clean
     # production extension and then layering the saved test-only override files on top.
     shutil.copytree(PRODUCTION_EXTENSION_DIR, bundle_dir, dirs_exist_ok=True)
+    # The test pipeline keeps richer extraction telemetry, but delegates all result
+    # rendering to this untouched production module so UI contract checks exercise
+    # the same expandable mixed/research presentation that ships to users.
+    shutil.copy2(
+        PRODUCTION_EXTENSION_DIR / "parseScript.js",
+        bundle_dir / "productionParseScript.js",
+    )
     for override_path in TEST_EXTENSION_OVERRIDES_DIR.iterdir():
         if override_path.is_file():
             shutil.copy2(override_path, bundle_dir / override_path.name)
@@ -130,11 +145,78 @@ def build_popup_url(extension_id: str, target_url: str) -> str:
     return f"chrome-extension://{extension_id}/extension.html?{query}"
 
 
-def build_result_record(url_entry: dict, state: dict, status_text: str) -> dict:
+def expected_mixed_count(fact_opinion: dict) -> int:
+    """Count explicit and legacy implicit mixed decisions in an API result."""
+    total = 0
+    for item in fact_opinion.get("items") or []:
+        final = item.get("final_prediction") or {}
+        if final.get("status") != "resolved":
+            continue
+        if final.get("label") == "mixed" or (
+            final.get("label") == "fact" and final.get("opinion_excerpts")
+        ):
+            total += 1
+    return total
+
+
+def validate_popup_contract(state: dict, ui: dict) -> list[str]:
+    """Return user-visible contract failures captured from the rendered popup."""
+    failures: list[str] = []
+    result = state.get("result") or {}
+    fact_opinion = result.get("fact_opinion") or {}
+    fact_items = fact_opinion.get("items") or []
+    research = result.get("ai_research") or {}
+    claims = research.get("claims") or []
+
+    if fact_items:
+        if not ui.get("fact_opinion_visible"):
+            failures.append("Fact/opinion section was not visible.")
+        if ui.get("fact_opinion_item_count") != len(fact_items):
+            failures.append("Rendered fact/opinion item count did not match the API result.")
+        if ui.get("fact_opinion_details_count") != len(fact_items):
+            failures.append("Every fact/opinion item must provide expandable decision details.")
+        if ui.get("mixed_item_count") != expected_mixed_count(fact_opinion):
+            failures.append("Rendered mixed-item count did not match the API result.")
+        expected_review_triggers = sum(
+            bool((item.get("local_prediction") or {}).get("review_reasons"))
+            for item in fact_items
+        )
+        if ui.get("review_trigger_count") != expected_review_triggers:
+            failures.append("Rendered review-trigger count did not match the API result.")
+
+    if not BIAS_ONLY_TEST and claims:
+        if not ui.get("sources_visible"):
+            failures.append("Research section was not visible.")
+        if ui.get("research_claim_count") != len(claims):
+            failures.append("Rendered research claim count did not match the API result.")
+        if ui.get("research_verdict_count") != len(claims):
+            failures.append("Every researched claim must show a verdict.")
+        if ui.get("research_evidence_count") != len(claims):
+            failures.append("Every researched claim must show its evidence summary.")
+        expected_source_links = sum(len(claim.get("sources") or []) for claim in claims)
+        if ui.get("source_link_count") != expected_source_links:
+            failures.append("Rendered source-link count did not match the API result.")
+
+    if not BIAS_ONLY_TEST and research.get("coverage") and not ui.get("coverage_visible"):
+        failures.append("Research coverage disclosure was not visible.")
+
+    return failures
+
+
+def build_result_record(
+    url_entry: dict,
+    state: dict,
+    status_text: str,
+    ui: dict,
+) -> dict:
     metadata = state.get("metadata") or {}
     attempts = state.get("attempts") or []
     ai_result = (state.get("result") or {}).get("ai_result") or {}
     highlights = ai_result.get("highlights")
+    result = state.get("result") or {}
+    fact_opinion = result.get("fact_opinion") or {}
+    research = result.get("ai_research") or {}
+    contract_failures = validate_popup_contract(state, ui)
     final_stage = attempts[-1]["stage"] if attempts else ""
 
     return {
@@ -146,6 +228,13 @@ def build_result_record(url_entry: dict, state: dict, status_text: str) -> dict:
         "message": status_text,
         "bias_score": ai_result.get("bias_score"),
         "highlight_count": len(highlights) if isinstance(highlights, list) else 0,
+        "fact_opinion_counts": fact_opinion.get("counts") or {},
+        "fact_opinion_item_count": len(fact_opinion.get("items") or []),
+        "research_claim_count": len(research.get("claims") or []),
+        "research_coverage": research.get("coverage") or {},
+        "ui_contract_passed": not contract_failures,
+        "ui_contract_failures": contract_failures,
+        "ui": ui,
         "extract_method": metadata.get("extractMethod") or "",
         "extract_endpoint": metadata.get("extractEndpoint") or "",
         "extracted_text_chars": metadata.get("extractedTextChars"),
@@ -179,7 +268,31 @@ def run_extension_test(context, extension_id: str, url_entry: dict) -> dict:
 
         status_text = popup_page.locator("#out").inner_text()
         state = popup_page.evaluate("() => window.__FACTGPT_TEST_STATE__ || {}")
-        return build_result_record(url_entry, state, status_text)
+        ui = popup_page.evaluate(
+            """
+            () => {
+              const visible = (selector) => {
+                const node = document.querySelector(selector);
+                return Boolean(node && getComputedStyle(node).display !== "none");
+              };
+              return {
+                fact_opinion_visible: visible("#fact-opinion-area_extension"),
+                fact_opinion_item_count: document.querySelectorAll(".fact-opinion-item").length,
+                fact_opinion_details_count: document.querySelectorAll(".fact-opinion-details").length,
+                mixed_item_count: document.querySelectorAll(".fact-opinion-item-mixed").length,
+                review_trigger_count: [...document.querySelectorAll(".fact-opinion-metadata dt")]
+                  .filter((node) => node.textContent.trim() === "Review trigger").length,
+                sources_visible: visible("#sources-area_extension"),
+                research_claim_count: document.querySelectorAll(".research-claim").length,
+                research_verdict_count: document.querySelectorAll(".research-claim .verdict-pill").length,
+                research_evidence_count: document.querySelectorAll(".research-claim .research-evidence").length,
+                source_link_count: document.querySelectorAll(".research-claim .source-link").length,
+                coverage_visible: Boolean(document.querySelector(".research-coverage"))
+              };
+            }
+            """
+        )
+        return build_result_record(url_entry, state, status_text, ui)
     finally:
         popup_page.close()
         article_page.close()
@@ -226,6 +339,11 @@ def print_summary(test_results: list[dict]) -> None:
     error_counts = Counter(
         result["message"] for result in test_results if result["status"] == "error"
     )
+    contract_failure_counts = Counter(
+        failure
+        for result in test_results
+        for failure in result.get("ui_contract_failures", [])
+    )
 
     print("\nSummary")
     print(f"- total: {len(test_results)}")
@@ -249,6 +367,15 @@ def print_summary(test_results: list[dict]) -> None:
         print("\nError Reasons")
         for message, count in error_counts.most_common():
             print(f"- {count}x {message}")
+
+    print("\nUI Contract")
+    print(
+        "- passed:",
+        sum(1 for result in test_results if result.get("ui_contract_passed")),
+    )
+    print("- failed:", sum(1 for result in test_results if not result.get("ui_contract_passed")))
+    for failure, count in contract_failure_counts.most_common():
+        print(f"- {count}x {failure}")
 
 
 def main():

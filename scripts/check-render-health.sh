@@ -1,4 +1,5 @@
 #!/bin/sh
+# Verify that a deployed backend's cheap liveness endpoint is ready for monitoring.
 set -eu
 
 BASE_URL="${1:-https://bias-article-detector.onrender.com}"

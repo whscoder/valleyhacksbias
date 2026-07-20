@@ -1,3 +1,4 @@
+// Test-only backend policy adds localhost before Playwright loads the bundle.
 function normalizeBaseUrl(value) {
   return String(value ?? "").trim().replace(/\/+$/, "");
 }

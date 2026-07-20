@@ -1,19 +1,30 @@
+// MV3 service worker: owns extraction/analysis jobs and persists their lifecycle.
 import {
   analyzeBiasText,
+  createPodcastJob,
   extractArticleFromUrl,
   extractRenderedArticleFromUrl,
+  getPodcastJob,
+  getPodcastSegments,
   researchText
 } from "./backendClient.js";
+import {
+  buildPodcastAnalysisKey,
+  normalizePodcastResult,
+  podcastStageText
+} from "./podcast.js";
 
 const LEGACY_ANALYSIS_PREFIXES = ["factgpt:analysis:"];
 const ANALYSIS_PREFIX = "factgpt:v2:analysis:";
 const LATEST_KEY = "factgpt:v2:latestAnalysisKey";
 const LEGACY_LATEST_KEYS = ["factgpt:latestAnalysisKey"];
 const MIN_TEXT_CHARS = 200;
+const PODCAST_POLL_MS = 1500;
 
 // In-memory dedupe for the current service-worker lifetime. The durable copy
 // of progress/results lives in chrome.storage.local below.
 const runningJobs = new Map();
+const runningPodcastJobs = new Map();
 
 async function purgeLegacyAnalysisCache() {
   const allData = await chrome.storage.local.get(null);
@@ -33,6 +44,16 @@ purgeLegacyAnalysisCache().catch((error) => {
 
 function normalizeText(value, fallback = "") {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text || fallback;
+}
+
+function normalizeArticleText(value, fallback = "") {
+  const text = String(value ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[^\S\n]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
   return text || fallback;
 }
 
@@ -107,6 +128,216 @@ async function saveAnalysisState(key, patch) {
   return next;
 }
 
+async function savePodcastState(key, patch) {
+  const existing = (await chrome.storage.local.get(key))[key] || {};
+  const next = {
+    ...existing,
+    ...patch,
+    mode: "podcast",
+    key,
+    updatedAt: Date.now()
+  };
+  await chrome.storage.local.set({ [key]: next });
+  return next;
+}
+
+async function discoverPodcastHints(tabId) {
+  if (!Number.isInteger(tabId)) {
+    return { feed_urls: [], transcript_urls: [], audio_urls: [] };
+  }
+
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const buckets = {
+          feed_urls: new Set(),
+          transcript_urls: new Set(),
+          audio_urls: new Set()
+        };
+        const add = (bucket, rawUrl) => {
+          if (!rawUrl) return;
+          try {
+            const url = new URL(String(rawUrl), document.baseURI);
+            if (url.protocol === "http:" || url.protocol === "https:") {
+              buckets[bucket].add(url.toString());
+            }
+          } catch {
+            // Ignore malformed publisher metadata; the backend validates every URL again.
+          }
+        };
+
+        document.querySelectorAll("link[rel~='alternate'], a[href]").forEach((node) => {
+          const href = node.getAttribute("href");
+          const type = String(node.getAttribute("type") || "").toLowerCase();
+          const rel = String(node.getAttribute("rel") || "").toLowerCase();
+          const label = String(node.textContent || node.getAttribute("aria-label") || "").toLowerCase();
+          if (type.includes("rss") || type.includes("atom") || /(^|\/)feed(?:\.|\/|$)|\.rss(?:$|\?)/i.test(href || "")) {
+            add("feed_urls", href);
+          }
+          if (
+            rel.includes("transcript") ||
+            type.includes("text/vtt") ||
+            type.includes("subrip") ||
+            /transcript|show notes/.test(label) ||
+            /transcript|\.vtt(?:$|\?)|\.srt(?:$|\?)/i.test(href || "")
+          ) {
+            add("transcript_urls", href);
+          }
+          if (
+            type.startsWith("audio/") ||
+            rel.includes("enclosure") && type.includes("audio") ||
+            /\.(?:mp3|m4a|aac|wav|ogg|opus)(?:$|\?)/i.test(href || "")
+          ) {
+            add("audio_urls", href);
+          }
+        });
+
+        document.querySelectorAll("audio[src], audio source[src], video source[type^='audio/']").forEach((node) => {
+          add("audio_urls", node.getAttribute("src"));
+        });
+        document.querySelectorAll(
+          "meta[property='og:audio'], meta[property='og:audio:url'], meta[name='twitter:player:stream']"
+        ).forEach((node) => add("audio_urls", node.getAttribute("content")));
+
+        const visitJsonLd = (value) => {
+          if (!value || typeof value !== "object") return;
+          if (Array.isArray(value)) {
+            value.forEach(visitJsonLd);
+            return;
+          }
+          const type = Array.isArray(value["@type"]) ? value["@type"].join(" ") : value["@type"];
+          if (/AudioObject|PodcastEpisode/i.test(String(type || ""))) {
+            add("audio_urls", value.contentUrl || value.url);
+            if (value.associatedMedia) visitJsonLd(value.associatedMedia);
+          }
+          if (value.transcript && /^https?:/i.test(String(value.transcript))) {
+            add("transcript_urls", value.transcript);
+          }
+          if (value["@graph"]) visitJsonLd(value["@graph"]);
+        };
+        document.querySelectorAll("script[type='application/ld+json']").forEach((node) => {
+          try {
+            visitJsonLd(JSON.parse(node.textContent || "null"));
+          } catch {
+            // Invalid structured data is common and should not block podcast discovery.
+          }
+        });
+
+        return Object.fromEntries(
+          Object.entries(buckets).map(([key, urls]) => [key, Array.from(urls).slice(0, 5)])
+        );
+      }
+    });
+    return injection?.result || { feed_urls: [], transcript_urls: [], audio_urls: [] };
+  } catch {
+    return { feed_urls: [], transcript_urls: [], audio_urls: [] };
+  }
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function pollPodcastJob({ key, jobId }) {
+  while (true) {
+    const response = await getPodcastJob(jobId);
+    const status = String(response?.status || "running").toLowerCase();
+    const stage = podcastStageText(response?.stage, "Podcast analysis running...");
+    const progress = Number(response?.progress);
+
+    if (status === "complete") {
+      await savePodcastState(key, {
+        status: "complete",
+        stage,
+        progress: 100,
+        completedAt: Date.now(),
+        retryable: false,
+        result: normalizePodcastResult(response)
+      });
+      return;
+    }
+    if (status === "failed") {
+      const backendError = response?.error;
+      const message = typeof backendError === "object"
+        ? backendError.message
+        : backendError;
+      await savePodcastState(key, {
+        status: "error",
+        stage: "Podcast analysis failed.",
+        completedAt: Date.now(),
+        retryable: response?.retryable !== false,
+        error: normalizeText(message, "Podcast analysis failed. Run it again.")
+      });
+      return;
+    }
+
+    await savePodcastState(key, {
+      status: status === "queued" ? "queued" : "running",
+      stage,
+      progress: Number.isFinite(progress) ? Math.max(0, Math.min(100, progress)) : null
+    });
+    await delay(PODCAST_POLL_MS);
+  }
+}
+
+async function runPodcastJob({ key, url, tabId, existingJobId = "" }) {
+  try {
+    let jobId = existingJobId;
+    if (!jobId) {
+      await savePodcastState(key, {
+        status: "running",
+        stage: "Finding podcast sources on this page...",
+        url,
+        tabId,
+        startedAt: Date.now(),
+        completedAt: null,
+        progress: 0,
+        error: "",
+        retryable: false,
+        result: null
+      });
+      const hints = await discoverPodcastHints(tabId);
+      const created = await createPodcastJob(url, hints);
+      jobId = normalizeText(created?.job_id, "");
+      if (!jobId) {
+        throw new Error("The podcast service did not return a job ID.");
+      }
+      await savePodcastState(key, {
+        jobId,
+        status: String(created?.status || "queued").toLowerCase(),
+        stage: podcastStageText(created?.stage || "queued"),
+        createdAt: created?.created_at || new Date().toISOString(),
+        reused: Boolean(created?.reused)
+      });
+    }
+    await pollPodcastJob({ key, jobId });
+  } catch (error) {
+    const current = (await chrome.storage.local.get(key))[key] || {};
+    await savePodcastState(key, {
+      status: "error",
+      stage: "Podcast analysis interrupted.",
+      completedAt: Date.now(),
+      retryable: true,
+      error: normalizeText(
+        error.message,
+        current.jobId
+          ? "The podcast job could not be resumed. Run it again."
+          : "Podcast analysis could not start."
+      )
+    });
+  } finally {
+    runningPodcastJobs.delete(key);
+  }
+}
+
+function ensurePodcastJob({ key, url, tabId, jobId = "" }) {
+  if (!runningPodcastJobs.has(key)) {
+    const job = runPodcastJob({ key, url, tabId, existingJobId: jobId });
+    runningPodcastJobs.set(key, job);
+  }
+}
+
 async function extractVisibleTextFromTab(tabId) {
   if (!Number.isInteger(tabId)) {
     return "";
@@ -151,7 +382,7 @@ async function extractArticleText(url, tabId, key) {
   try {
     await saveAnalysisState(key, { stage: "Extracting readable text..." });
     const data = await extractArticleFromUrl(url);
-    const text = normalizeText(data.text, "");
+    const text = normalizeArticleText(data.text, "");
     if (text.length >= MIN_TEXT_CHARS) {
       return text;
     }
@@ -178,7 +409,7 @@ async function extractArticleText(url, tabId, key) {
 
   await saveAnalysisState(key, { stage: "Trying browser-rendered extraction..." });
   const rendered = await extractRenderedArticleFromUrl(url);
-  const renderedText = normalizeText(rendered.text, "");
+  const renderedText = normalizeArticleText(rendered.text, "");
   if (renderedText.length < MIN_TEXT_CHARS) {
     throw new Error("Not enough readable text found on this page.");
   }
@@ -208,17 +439,28 @@ async function runAnalysisJob({ key, url, tabId }) {
     await saveAnalysisState(key, { stage: "Running quick bias scan..." });
     const biasResult = await analyzeBiasText(articleText);
     const aiBias = biasResult.ai_result || {};
+    const factOpinion = biasResult.fact_opinion || null;
 
     // Save the bias result immediately; research can fail or take longer, but
     // the user should still get the core bias scan when they reopen the popup.
     await saveAnalysisState(key, {
       status: "running",
       stage: "Bias complete. Gathering sources...",
-      partialResult: { ai_result: aiBias, ai_research: {} }
+      partialResult: {
+        ai_result: aiBias,
+        ai_research: {},
+        fact_opinion: factOpinion
+      }
     });
 
     try {
-      const researchResult = await researchText(articleText);
+      const researchResult = await researchText(
+        articleText,
+        "Article Analysis",
+        factOpinion,
+        aiBias
+      );
+      const finalFactOpinion = researchResult.fact_opinion || factOpinion;
 
       await saveAnalysisState(key, {
         status: "complete",
@@ -226,7 +468,8 @@ async function runAnalysisJob({ key, url, tabId }) {
         completedAt: Date.now(),
         result: {
           ai_result: aiBias,
-          ai_research: researchResult.ai_research || {}
+          ai_research: researchResult.ai_research || {},
+          fact_opinion: finalFactOpinion
         },
         partialResult: null
       });
@@ -235,7 +478,11 @@ async function runAnalysisJob({ key, url, tabId }) {
         status: "partial",
         stage: "Bias complete. Sources unavailable right now.",
         completedAt: Date.now(),
-        result: { ai_result: aiBias, ai_research: {} },
+        result: {
+          ai_result: aiBias,
+          ai_research: {},
+          fact_opinion: factOpinion
+        },
         partialResult: null,
         researchError: normalizeText(error.message, "Research failed.")
       });
@@ -260,6 +507,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
+  if (message?.type === "FACTGPT_PODCAST_ANALYSIS_KEY") {
+    sendResponse({ key: buildPodcastAnalysisKey(message.url) });
+    return false;
+  }
+
   if (message?.type === "FACTGPT_START_ANALYSIS") {
     const key = buildAnalysisKey(message.url);
     if (!runningJobs.has(key)) {
@@ -268,6 +520,36 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
     sendResponse({ ok: true, key });
     return false;
+  }
+
+
+  if (message?.type === "FACTGPT_START_PODCAST_ANALYSIS") {
+    const key = buildPodcastAnalysisKey(message.url);
+    ensurePodcastJob({ key, url: message.url, tabId: message.tabId });
+    sendResponse({ ok: true, key });
+    return false;
+  }
+
+  if (message?.type === "FACTGPT_RESUME_PODCAST_ANALYSIS") {
+    const key = buildPodcastAnalysisKey(message.url);
+    ensurePodcastJob({
+      key,
+      url: message.url,
+      tabId: message.tabId,
+      jobId: normalizeText(message.jobId, "")
+    });
+    sendResponse({ ok: true, key });
+    return false;
+  }
+
+  if (message?.type === "FACTGPT_GET_PODCAST_SEGMENTS") {
+    getPodcastSegments(message.jobId, message.cursor, message.limit)
+      .then((result) => sendResponse({ ok: true, result }))
+      .catch((error) => sendResponse({
+        ok: false,
+        error: normalizeText(error.message, "Transcript could not be loaded.")
+      }));
+    return true;
   }
 
   return false;

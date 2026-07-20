@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 .venv/
+.venv-broken/
 __pycache__/
 .DS_Store
 *.pyc
@@ -21,3 +22,11 @@ back-end/testingcode/reports/
 back-end/testingcode/__pycache__/
 backups/
 warc.paths.gz
+
+# Training corpora stay local; Render only needs the saved production model.
+data/**
+!data/fact_opinion/
+data/fact_opinion/**
+!data/fact_opinion/processed/
+data/fact_opinion/processed/**
+!data/fact_opinion/processed/fact_opinion_classifier.pkl

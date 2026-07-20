@@ -1,3 +1,5 @@
+"""Collect article URLs from a Common Crawl CC-NEWS WARC archive."""
+
 import argparse
 import gzip
 import io

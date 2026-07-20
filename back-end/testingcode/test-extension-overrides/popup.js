@@ -1,3 +1,4 @@
+// Test-only popup controller accepts URL/query hooks and exposes machine-readable state.
 import { parseText } from "./parseScript.js";
 export let capturedUrl = "";
 // Test hook: Playwright can pass a target page URL directly into the popup.
