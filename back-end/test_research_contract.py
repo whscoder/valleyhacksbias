@@ -173,7 +173,7 @@ class ResearchToolOrchestrationTests(unittest.TestCase):
         self.assertEqual(result["error_code"], "research_no_web_search")
         self.assertNotIn("completed", result["error"])
 
-    def test_research_rejects_citation_absent_from_web_results(self):
+    def test_research_removes_unverified_citation_and_downgrades_claim(self):
         parsed = research_output(research_claim(url="https://invented.example/report"))
         response = web_response(parsed, "https://example.gov/report")
 
@@ -182,7 +182,10 @@ class ResearchToolOrchestrationTests(unittest.TestCase):
         ):
             result = asyncio.run(home.researcher_ai("A factual statement."))
 
-        self.assertEqual(result["error_code"], "research_unverified_citation")
+        self.assertEqual(result["claims"][0]["verdict"], "unclear")
+        self.assertEqual(result["claims"][0]["sources"], [])
+        self.assertEqual(result["overall_reliability"], "low")
+        self.assertIn("Unverified citation links were removed", result["notes"])
 
     def test_research_accepts_url_citation_annotations_without_action_sources(self):
         parsed = research_output(research_claim(url="https://EXAMPLE.gov/report/"))
@@ -197,7 +200,72 @@ class ResearchToolOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(result, parsed)
 
-    def test_research_rejects_completed_search_without_citations(self):
+    def test_research_accepts_completed_action_url(self):
+        for action_type in ("open_page", "find_in_page"):
+            with self.subTest(action_type=action_type):
+                parsed = research_output(research_claim())
+                response = web_response(parsed, "https://search.example/result")
+                response["output"].insert(
+                    1,
+                    {
+                        "type": "web_search_call",
+                        "status": "completed",
+                        "action": {
+                            "type": action_type,
+                            "url": "https://example.gov/report",
+                        },
+                    },
+                )
+
+                with patch.object(
+                    home, "run_model_json", new=AsyncMock(return_value=response)
+                ):
+                    result = asyncio.run(
+                        home.researcher_ai("A factual statement.")
+                    )
+
+                self.assertEqual(result, parsed)
+
+    def test_research_accepts_equivalent_url_with_tracking_parameters(self):
+        parsed = research_output(
+            research_claim(url="https://example.gov/report?section=2")
+        )
+        response = web_response(
+            parsed,
+            "https://example.gov/report?utm_source=search&section=2&gclid=abc",
+        )
+
+        with patch.object(
+            home, "run_model_json", new=AsyncMock(return_value=response)
+        ):
+            result = asyncio.run(home.researcher_ai("A factual statement."))
+
+        self.assertEqual(result, parsed)
+
+    def test_research_does_not_trust_incomplete_action_url(self):
+        parsed = research_output(research_claim())
+        response = web_response(parsed, "https://search.example/result")
+        response["output"].insert(
+            1,
+            {
+                "type": "web_search_call",
+                "status": "incomplete",
+                "action": {
+                    "type": "find_in_page",
+                    "url": "https://example.gov/report",
+                },
+            },
+        )
+
+        with patch.object(
+            home, "run_model_json", new=AsyncMock(return_value=response)
+        ):
+            result = asyncio.run(home.researcher_ai("A factual statement."))
+
+        self.assertEqual(result["claims"][0]["verdict"], "unclear")
+        self.assertEqual(result["claims"][0]["sources"], [])
+
+    def test_research_completed_search_without_citations_returns_safe_unclear_claim(self):
         parsed = research_output(research_claim())
         response = web_response(parsed)
 
@@ -206,7 +274,38 @@ class ResearchToolOrchestrationTests(unittest.TestCase):
         ):
             result = asyncio.run(home.researcher_ai("A factual statement."))
 
-        self.assertEqual(result["error_code"], "research_unverified_citation")
+        self.assertEqual(result["claims"][0]["verdict"], "unclear")
+        self.assertEqual(result["claims"][0]["sources"], [])
+        self.assertEqual(result["overall_reliability"], "low")
+
+    def test_research_retries_token_truncation_with_remaining_global_budget(self):
+        parsed = research_output(research_claim())
+        incomplete = {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [],
+        }
+        complete = web_response(parsed, "https://example.gov/report")
+
+        with patch.object(
+            home,
+            "run_model_json",
+            new=AsyncMock(side_effect=[incomplete, complete]),
+        ) as run:
+            result = asyncio.run(
+                home.researcher_ai(
+                    "A factual statement.", timeout_seconds=60.0
+                )
+            )
+
+        self.assertEqual(result, parsed)
+        self.assertEqual(run.await_count, 2)
+        self.assertEqual(
+            [call.kwargs["max_tokens"] for call in run.await_args_list],
+            [1800, 2600],
+        )
+        self.assertGreater(run.await_args_list[0].kwargs["timeout"], 30.0)
+        self.assertGreater(run.await_args_list[1].kwargs["timeout"], 30.0)
 
     def test_analyze_passes_validated_bias_to_research_sequentially(self):
         text = ("The rate was four percent. " * 10).strip()
@@ -238,7 +337,7 @@ class ResearchToolOrchestrationTests(unittest.TestCase):
         self.assertEqual(supplied_bias.model_dump(mode="json"), bias_output)
         self.assertEqual(response["ai_research"].coverage.status, "partial")
 
-    def test_article_job_keeps_bias_partial_result_when_research_provenance_fails(self):
+    def test_article_job_completes_when_research_is_unavailable(self):
         text = ("The published rate was four percent. " * 8).strip()
         classification = make_result(
             text, [("fact", []) for _ in home.segment_article(text)]
@@ -283,12 +382,16 @@ class ResearchToolOrchestrationTests(unittest.TestCase):
                 asyncio.run(home.run_article_job(job_id, request))
 
             job = home.article_jobs[job_id]
-            self.assertEqual(job["status"], "failed")
-            self.assertEqual(
-                job["error"]["code"], "research_unverified_citation"
-            )
+            self.assertEqual(job["status"], "complete")
+            self.assertIsNone(job["error"])
             self.assertIsNotNone(job["result"]["ai_result"])
-            self.assertEqual(job["result"]["status"], "partial")
+            self.assertEqual(job["result"]["status"], "analyzed")
+            research = job["result"]["ai_research"]
+            self.assertEqual(research["claims"], [])
+            self.assertEqual(research["overall_reliability"], "not_assessed")
+            self.assertEqual(research["coverage"]["checked_claim_count"], 0)
+            self.assertGreater(research["coverage"]["candidate_claim_count"], 0)
+            self.assertIn("verification was unavailable", research["notes"])
         finally:
             home.article_jobs.pop(job_id, None)
 

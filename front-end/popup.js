@@ -543,8 +543,10 @@ async function refreshArticleIfNeeded(state, force = false) {
   }
 }
 
-async function switchMode(mode) {
-  activeMode = mode === MODES.podcast ? MODES.podcast : MODES.article;
+async function switchMode() {
+  // Podcast mode is deferred for this release. Always overwrite any stale
+  // selected-mode preference so the popup cannot reopen in podcast mode.
+  activeMode = MODES.article;
   resetRenderedResultState();
   await chrome.storage.local.set({ [SELECTED_MODE_KEY]: activeMode });
   for (const candidate of Object.values(MODES)) {
@@ -596,11 +598,6 @@ async function initPopup() {
       getAnalysisKey(url, MODES.article),
       getAnalysisKey(url, MODES.podcast)
     ]);
-    const settings = await chrome.storage.local.get(SELECTED_MODE_KEY);
-    const savedMode = settings[SELECTED_MODE_KEY] === MODES.podcast
-      ? MODES.podcast
-      : MODES.article;
-
     document.getElementById("mode-article")?.addEventListener("click", () => {
       switchMode(MODES.article).catch((error) => { out.textContent = `Error: ${error.message}`; });
     });
@@ -620,7 +617,7 @@ async function initPopup() {
     });
     document.getElementById("podcast-load-more")?.addEventListener("click", loadTranscriptPage);
     watchStoredStates();
-    await switchMode(savedMode);
+    await switchMode();
   } catch (error) {
     out.textContent = `Error: ${error.message}`;
   }

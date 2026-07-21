@@ -13,15 +13,6 @@
         <p class="brand-subtitle">Bias and reliability scanner</p>
       </header>
 
-      <div class="mode-selector" role="group" aria-label="Analysis mode">
-        <button id="mode-article" class="mode-option mode-option-active" type="button" aria-pressed="true">
-          Article
-        </button>
-        <button id="mode-podcast" class="mode-option" type="button" aria-pressed="false">
-          Podcast
-        </button>
-      </div>
-
       <button id="analyze" class="analyze-btn">Analyze Current Page</button>
       <p id="out" class="status-line" aria-live="polite"></p>
 
@@ -54,20 +45,6 @@
         </div>
       </section>
 
-      <section id="podcast-transcript-area" class="podcast-transcript-container" style="display: none;">
-        <div class="podcast-transcript-box">
-          <h3>Episode Transcript</h3>
-          <p id="podcast-meta" class="podcast-meta"></p>
-          <details id="podcast-transcript-details">
-            <summary>Show speaker transcript</summary>
-            <p id="podcast-seek-status" class="podcast-seek-status" aria-live="polite"></p>
-            <ol id="podcast-segments" class="podcast-segments"></ol>
-            <button id="podcast-load-more" class="podcast-load-more" type="button" style="display: none;">
-              Load more transcript
-            </button>
-          </details>
-        </div>
-      </section>
     </main>
 
     <script type="module" src="popup.js"></script>

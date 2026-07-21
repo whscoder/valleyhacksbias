@@ -216,7 +216,7 @@ class ArticleJobApiTests(unittest.IsolatedAsyncioTestCase):
         direct.assert_awaited_once()
         rendered_fetch.assert_awaited_once()
 
-    async def test_research_failure_preserves_bias_and_sanitizes_error(self):
+    async def test_research_failure_completes_with_safe_unavailable_result(self):
         text = article_text()
         classification = result_for(text, "fact")
         bias = home.no_factual_bias_result().model_dump(mode="json")
@@ -253,18 +253,101 @@ class ArticleJobApiTests(unittest.IsolatedAsyncioTestCase):
                     }
                 ),
             ),
-            patch.object(home.logger, "exception"),
+            patch.object(home.logger, "warning") as warning,
         ):
             await home.run_article_job(job_id, payload)
 
         response = await self.client.get(f"/article-jobs/{job_id}")
         body = response.json()
-        self.assertEqual(body["status"], "failed")
+        self.assertEqual(body["status"], "complete")
         self.assertIsNotNone(body["result"]["ai_result"])
-        self.assertIsNone(body["result"]["ai_research"])
-        self.assertEqual(body["error"]["code"], "research_model_failure")
-        self.assertEqual(body["error"]["reference"], "safe-reference")
-        self.assertNotIn("provider_secret", str(body["error"]))
+        self.assertEqual(body["result"]["ai_research"]["claims"], [])
+        self.assertIn(
+            "verification was unavailable",
+            body["result"]["ai_research"]["notes"],
+        )
+        self.assertIsNone(body["error"])
+        warning.assert_called_once_with(
+            "Article research unavailable; job_id=%s error_code=%s reference=%s",
+            job_id,
+            "research_model_failure",
+            "safe-reference",
+        )
+        self.assertNotIn("provider_secret", str(body))
+
+    async def test_non_verbatim_bias_highlight_does_not_fail_article_job(self):
+        text = article_text()
+        classification = result_for(text, "fact")
+        bias = home.no_factual_bias_result().model_dump(mode="json")
+        bias.update(
+            {
+                "bias_score": 5,
+                "highlights": [
+                    "The published rate",
+                    "The published rate is four percent",
+                ],
+                "highlight_reasons": [
+                    {"phrase": "The published rate", "reason": "x" * 180},
+                    {
+                        "phrase": "The published rate is four percent",
+                        "reason": "y" * 180,
+                    },
+                ],
+            }
+        )
+        research = {
+            "claims": [],
+            "overall_reliability": "not_assessed",
+            "notes": "No claims were returned by this deterministic test.",
+        }
+        payload = home.ArticleJobRequest(
+            page_url="https://publisher.example/story", text=text, title="Rates"
+        )
+        job_id = "article-invalid-highlight"
+        now = 1000.0
+        home.article_jobs[job_id] = {
+            "status": "queued",
+            "stage": "Article analysis queued.",
+            "progress": 0,
+            "created_at": now,
+            "updated_at": now,
+            "content_key": "invalid-highlight-key",
+        }
+
+        with (
+            patch.object(
+                home,
+                "classify_article_fact_opinion",
+                new=AsyncMock(return_value=classification),
+            ),
+            patch.object(home, "analyze_bias", new=AsyncMock(return_value=bias)),
+            patch.object(
+                home, "researcher_ai", new=AsyncMock(return_value=research)
+            ) as research_call,
+            patch.object(home.logger, "warning") as warning,
+        ):
+            await home.run_article_job(job_id, payload)
+
+        body = (await self.client.get(f"/article-jobs/{job_id}")).json()
+        self.assertEqual(body["status"], "complete")
+        self.assertEqual(
+            body["result"]["ai_result"]["highlights"],
+            ["The published rate"],
+        )
+        self.assertEqual(
+            [
+                reason["phrase"]
+                for reason in body["result"]["ai_result"]["highlight_reasons"]
+            ],
+            ["The published rate"],
+        )
+        warning.assert_called_once_with(
+            "Dropped non-verbatim bias highlights; dropped_count=%s", 1
+        )
+        self.assertEqual(
+            research_call.await_args.kwargs["timeout_seconds"],
+            home.OPENAI_BACKGROUND_RESEARCH_TIMEOUT_SECONDS,
+        )
 
     async def test_missing_job_explains_backend_restart(self):
         response = await self.client.get("/article-jobs/missing-after-restart")

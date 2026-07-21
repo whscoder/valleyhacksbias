@@ -5,8 +5,6 @@ import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from fastapi import HTTPException
-
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
 
 import home
@@ -103,9 +101,18 @@ class QuoteParsingTests(unittest.TestCase):
         scored_text = "The report was published."
         model_result = home.no_factual_bias_result().model_dump(mode="json")
         model_result["highlights"] = ["a total disaster."]
+        model_result["highlight_reasons"] = [
+            {"phrase": "a total disaster.", "reason": "x" * 180}
+        ]
 
-        with self.assertRaises(HTTPException):
-            home.validate_ai_bias(model_result, scored_text)
+        with patch.object(home.logger, "warning") as warning:
+            validated = home.validate_ai_bias(model_result, scored_text)
+
+        self.assertEqual(validated.highlights, [])
+        self.assertEqual(validated.highlight_reasons, [])
+        warning.assert_called_once_with(
+            "Dropped non-verbatim bias highlights; dropped_count=%s", 1
+        )
 
     def test_analyze_bias_timeout_returns_retryable_error(self):
         async def never_finishes(**_kwargs):
@@ -138,12 +145,30 @@ class QuoteParsingTests(unittest.TestCase):
 
         with (
             patch.object(home, "OPENAI_RESEARCH_TIMEOUT_SECONDS", 0.01),
-            patch.object(home, "run_model_json", side_effect=never_finishes),
+            patch.object(
+                home, "run_model_json", side_effect=never_finishes
+            ) as run,
         ):
             result = asyncio.run(home.researcher_ai("A factual passage long enough to research."))
 
         self.assertEqual(result["error_code"], "research_timeout")
         self.assertIn("timed out", result["error"].lower())
+        self.assertEqual(run.await_count, 1)
+
+    def test_research_timeout_environment_is_finite_and_bounded(self):
+        setting = "FACTGPT_TEST_TIMEOUT_SECONDS"
+        for raw, expected in (
+            ("not-a-number", 120.0),
+            ("nan", 120.0),
+            ("5", 30.0),
+            ("900", 600.0),
+            ("300", 300.0),
+        ):
+            with self.subTest(raw=raw), patch.dict(os.environ, {setting: raw}):
+                self.assertEqual(
+                    home._bounded_env_float(setting, 120.0, 30.0, 600.0),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

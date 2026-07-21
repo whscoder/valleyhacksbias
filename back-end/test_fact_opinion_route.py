@@ -359,6 +359,13 @@ class FactOpinionPipelineTests(unittest.TestCase):
 
         self.assertEqual(result[0]["label"], "opinion")
         self.assertEqual(run.await_count, 2)
+        for call in run.await_args_list:
+            self.assertEqual(call.kwargs["model"], home.FACT_OPINION_API_MODEL)
+            self.assertEqual(
+                call.kwargs["reasoning"],
+                {"effort": home.FACT_OPINION_REASONING_EFFORT},
+            )
+            self.assertFalse(call.kwargs["store"])
 
     def test_refusal_or_malformed_output_does_not_create_a_decision(self):
         batch = [(0, {"id": "item-0000", "text": "It may happen."})]
@@ -532,18 +539,28 @@ class FactOpinionPipelineTests(unittest.TestCase):
             home.article_classification_is_authentic(text, "Rates", tampered)
         )
 
-    def test_bias_validation_requires_exact_source_highlights_and_score_range(self):
+    def test_bias_validation_drops_non_source_highlights_and_keeps_reasons_aligned(self):
         raw = home.no_factual_bias_result().model_dump(mode="json")
         raw["bias_score"] = 5
-        raw["highlights"] = ["loaded phrase"]
+        raw["highlights"] = ["loaded phrase", "paraphrased phrase"]
         raw["highlight_reasons"] = [
-            {"phrase": "loaded phrase", "reason": "x" * 180}
+            {"phrase": "loaded phrase", "reason": "x" * 180},
+            {"phrase": "paraphrased phrase", "reason": "y" * 180},
         ]
 
-        accepted = home.validate_ai_bias(raw, "Text with a loaded phrase inside.")
+        with patch.object(home.logger, "warning") as warning:
+            accepted = home.validate_ai_bias(
+                raw, "Text with a loaded phrase inside."
+            )
+
         self.assertEqual(accepted.highlights, ["loaded phrase"])
-        with self.assertRaises(HTTPException):
-            home.validate_ai_bias(raw, "Text without the highlighted wording.")
+        self.assertEqual(
+            [reason.phrase for reason in accepted.highlight_reasons],
+            ["loaded phrase"],
+        )
+        warning.assert_called_once_with(
+            "Dropped non-verbatim bias highlights; dropped_count=%s", 1
+        )
 
         raw["bias_score"] = 11
         with self.assertRaises(HTTPException):

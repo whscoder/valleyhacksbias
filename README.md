@@ -40,6 +40,16 @@ FACTGPT_RATE_LIMIT_PER_MINUTE
 ```
 
 The backend also supports request and fetch caps through `FACTGPT_MAX_REQUEST_BODY_BYTES`, `FACTGPT_MAX_REQUEST_TEXT_CHARS`, `FACTGPT_MAX_FETCH_BYTES`, and `FACTGPT_MAX_EXTRACTED_TEXT_CHARS`.
+Routed fact/opinion review defaults to the low-latency `gpt-5.6-luna` model with
+reasoning effort `none`. Override these through `FACTGPT_FACT_OPINION_API_MODEL`
+and `FACTGPT_FACT_OPINION_REASONING_EFFORT` after validating representative
+routed passages.
+Bias and synchronous web-research deadlines are configurable through
+`FACTGPT_OPENAI_BIAS_TIMEOUT_SECONDS` and
+`FACTGPT_OPENAI_RESEARCH_TIMEOUT_SECONDS`. Backend-owned article and podcast jobs
+use `FACTGPT_OPENAI_BACKGROUND_RESEARCH_TIMEOUT_SECONDS`, whose recommended
+300-second deadline accommodates several search and page-open actions without
+holding an extension request open.
 
 Podcast downloads and job retention are controlled separately through
 `FACTGPT_MAX_PODCAST_AUDIO_BYTES`, `FACTGPT_MAX_PODCAST_DURATION_SECONDS`,

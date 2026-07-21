@@ -18,7 +18,7 @@ import socket
 import tempfile
 import time
 from typing import Any, Callable, Literal
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 import uvicorn
@@ -65,6 +65,22 @@ except Exception:
 def parse_env_bool(value: str | None) -> bool:
     """Parse common truthy environment variable values."""
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _bounded_env_float(
+    name: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    """Read a finite float setting and constrain unsafe timeout values."""
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return min(maximum, max(minimum, value))
 
 
 # Supported article quotation marks. Straight double quotes are ambiguous until
@@ -184,7 +200,22 @@ def extract_quoted_phrases(
 
 # Centralized runtime settings keep thresholds easy to tune.
 MODEL_NAME = "gpt-4o-mini"
-FACT_OPINION_API_MODEL = "gpt-5.6-sol"
+FACT_OPINION_API_MODEL = (
+    os.getenv("FACTGPT_FACT_OPINION_API_MODEL", "gpt-5.6-luna").strip()
+    or "gpt-5.6-luna"
+)
+FACT_OPINION_REASONING_EFFORT = os.getenv(
+    "FACTGPT_FACT_OPINION_REASONING_EFFORT", "none"
+).strip().lower()
+if FACT_OPINION_REASONING_EFFORT not in {
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+}:
+    FACT_OPINION_REASONING_EFFORT = "none"
 RESEARCH_API_MODEL = "gpt-5.5"
 MIN_EXTRACT_CHARS = 200
 MAX_RESEARCH_INPUT_CHARS = 6000
@@ -251,8 +282,11 @@ OPENAI_CLASSIFICATION_TOKEN_LIMITS = (4_000, 6_000)
 OPENAI_BIAS_TIMEOUT_SECONDS = float(
     os.getenv("FACTGPT_OPENAI_BIAS_TIMEOUT_SECONDS", "60")
 )
-OPENAI_RESEARCH_TIMEOUT_SECONDS = float(
-    os.getenv("FACTGPT_OPENAI_RESEARCH_TIMEOUT_SECONDS", "120")
+OPENAI_RESEARCH_TIMEOUT_SECONDS = _bounded_env_float(
+    "FACTGPT_OPENAI_RESEARCH_TIMEOUT_SECONDS", 120.0, 30.0, 600.0
+)
+OPENAI_BACKGROUND_RESEARCH_TIMEOUT_SECONDS = _bounded_env_float(
+    "FACTGPT_OPENAI_BACKGROUND_RESEARCH_TIMEOUT_SECONDS", 300.0, 30.0, 600.0
 )
 MAX_PODCAST_AUDIO_BYTES = int(
     os.getenv("FACTGPT_MAX_PODCAST_AUDIO_BYTES", "200000000")
@@ -938,7 +972,7 @@ async def _classify_openai_batch(
                 schema=fact_opinion_schema,
                 max_tokens=max_tokens,
                 model=FACT_OPINION_API_MODEL,
-                reasoning={"effort": "medium"},
+                reasoning={"effort": FACT_OPINION_REASONING_EFFORT},
                 store=False,
                 timeout=remaining_seconds,
             ),
@@ -1726,18 +1760,28 @@ def _normalize_provenance_url(value: Any) -> str | None:
     ):
         hostname = f"{hostname}:{port}"
     path = parsed.path.rstrip("/") or "/"
-    return urlunsplit((parsed.scheme.lower(), hostname, path, parsed.query, ""))
+    tracking_keys = {"fbclid", "gclid", "mc_cid", "mc_eid"}
+    query_items = [
+        (key, item_value)
+        for key, item_value in parse_qsl(parsed.query, keep_blank_values=True)
+        if not key.lower().startswith("utm_") and key.lower() not in tracking_keys
+    ]
+    query = urlencode(sorted(query_items), doseq=True)
+    return urlunsplit((parsed.scheme.lower(), hostname, path, query, ""))
 
 
 def _web_search_provenance_diagnostics(response: Any) -> dict[str, int]:
     """Return safe, payload-free counts for web-search provenance diagnostics."""
     completed_searches = 0
     action_sources = 0
+    action_urls = 0
     annotations = 0
     for item in _get(response, "output", []) or []:
         if _get(item, "type") == "web_search_call" and _get(item, "status") == "completed":
             completed_searches += 1
-            action_sources += len(_get(_get(item, "action", {}), "sources", []) or [])
+            action = _get(item, "action", {})
+            action_sources += len(_get(action, "sources", []) or [])
+            action_urls += bool(_normalize_provenance_url(_get(action, "url")))
         if _get(item, "type") == "message":
             for content in _get(item, "content", []) or []:
                 annotations += sum(
@@ -1747,6 +1791,7 @@ def _web_search_provenance_diagnostics(response: Any) -> dict[str, int]:
     return {
         "completed_searches": completed_searches,
         "action_sources": action_sources,
+        "action_urls": action_urls,
         "url_citation_annotations": annotations,
     }
 
@@ -1769,6 +1814,9 @@ def _completed_web_search_urls(response: Any) -> set[str]:
             source_url = _normalize_provenance_url(_get(source, "url"))
             if source_url:
                 source_urls.add(source_url)
+        action_url = _normalize_provenance_url(_get(action, "url"))
+        if action_url:
+            source_urls.add(action_url)
 
     if not _has_completed_web_search(response):
         return set()
@@ -1787,24 +1835,67 @@ def _completed_web_search_urls(response: Any) -> set[str]:
     return source_urls | annotation_urls
 
 
-def _validate_research_url_provenance(
+def _sanitize_research_url_provenance(
     parsed: dict[str, Any], searched_urls: set[str]
-) -> None:
-    """Reject citations that were not present in this response's web results."""
+) -> tuple[dict[str, Any], int, int]:
+    """Remove unverified citations and conservatively downgrade affected claims."""
     claims = parsed.get("claims")
     if not isinstance(claims, list):
         raise ValueError("Research response claims are malformed.")
+
+    sanitized = dict(parsed)
+    sanitized_claims: list[dict[str, Any]] = []
+    dropped_source_count = 0
+    downgraded_claim_count = 0
     for claim in claims:
         if not isinstance(claim, dict) or not isinstance(claim.get("sources"), list):
             raise ValueError("Research response sources are malformed.")
+        sanitized_claim = dict(claim)
+        verified_sources: list[dict[str, Any]] = []
         for source in claim["sources"]:
             if not isinstance(source, dict):
                 raise ValueError("Research response source is malformed.")
             normalized = _normalize_provenance_url(source.get("url"))
-            if not normalized or normalized not in searched_urls:
-                raise ResearchCitationProvenanceError(
-                    "A cited source was absent from the completed web search."
-                )
+            if normalized and normalized in searched_urls:
+                verified_sources.append(dict(source))
+            else:
+                dropped_source_count += 1
+
+        sanitized_claim["sources"] = verified_sources
+        has_authoritative_source = any(
+            source.get("source_type") in {
+                "primary",
+                "official",
+                "reputable_secondary",
+            }
+            for source in verified_sources
+        )
+        if (
+            sanitized_claim.get("verdict") in {"supported", "contradicted"}
+            and not has_authoritative_source
+        ):
+            sanitized_claim["verdict"] = "unclear"
+            sanitized_claim["evidence_summary"] = (
+                "This claim could not receive a sourced verdict because its returned "
+                "citation links could not be matched to the completed web search."
+            )
+            downgraded_claim_count += 1
+        sanitized_claims.append(sanitized_claim)
+
+    sanitized["claims"] = sanitized_claims
+    if dropped_source_count:
+        if downgraded_claim_count:
+            sanitized["overall_reliability"] = "low"
+        elif sanitized.get("overall_reliability") == "high":
+            sanitized["overall_reliability"] = "medium"
+        suffix = (
+            " Unverified citation links were removed before this result was returned; "
+            "claims without a verified authoritative source were marked unclear."
+        )
+        notes = str(sanitized.get("notes") or "").strip()
+        sanitized["notes"] = f"{notes[:1000 - len(suffix)].rstrip()}{suffix}".strip()
+
+    return sanitized, dropped_source_count, downgraded_claim_count
 
 
 async def researcher_ai(
@@ -1816,6 +1907,7 @@ async def researcher_ai(
     article_input_truncated: bool = False,
     speaker_spans: list[dict[str, Any]] | None = None,
     source_kind: Literal["article", "podcast"] = "article",
+    timeout_seconds: float | None = None,
 ) -> dict:
     """Run source-backed research with retry on token-limit truncation."""
     condensed_text = text.strip()[:MAX_RESEARCH_INPUT_CHARS]
@@ -1852,12 +1944,15 @@ async def researcher_ai(
         "return": "valid JSON only",
     }
 
+    timeout_budget = (
+        OPENAI_RESEARCH_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else max(0.001, float(timeout_seconds))
+    )
+    started_at = asyncio.get_running_loop().time()
     try:
         last_error: Exception | None = None
-        deadline = (
-            asyncio.get_running_loop().time()
-            + OPENAI_RESEARCH_TIMEOUT_SECONDS
-        )
+        deadline = started_at + timeout_budget
         for max_tokens in (1800, 2600):
             # Retry once with more output tokens if the model truncates.
             remaining_seconds = deadline - asyncio.get_running_loop().time()
@@ -1887,32 +1982,46 @@ async def researcher_ai(
                     if not _has_completed_web_search(response):
                         logger.warning(
                             "Research provenance rejected; category=no_completed_search "
-                            "completed_searches=%d action_sources=%d url_citation_annotations=%d",
+                            "completed_searches=%d action_sources=%d action_urls=%d "
+                            "url_citation_annotations=%d",
                             diagnostics["completed_searches"],
                             diagnostics["action_sources"],
+                            diagnostics["action_urls"],
                             diagnostics["url_citation_annotations"],
                         )
                         raise MissingWebSearchError(
                             "Research response did not complete a web search."
                         )
                     searched_urls = _completed_web_search_urls(response)
-                    try:
-                        _validate_research_url_provenance(parsed, searched_urls)
-                    except ResearchCitationProvenanceError:
+                    (
+                        parsed,
+                        dropped_source_count,
+                        downgraded_claim_count,
+                    ) = _sanitize_research_url_provenance(parsed, searched_urls)
+                    if dropped_source_count:
                         logger.warning(
-                            "Research provenance rejected; category=unverified_citation "
-                            "completed_searches=%d action_sources=%d url_citation_annotations=%d canonical_urls=%d",
+                            "Research provenance sanitized; category=unverified_citation "
+                            "completed_searches=%d action_sources=%d action_urls=%d "
+                            "url_citation_annotations=%d canonical_urls=%d "
+                            "dropped_sources=%d downgraded_claims=%d",
                             diagnostics["completed_searches"],
                             diagnostics["action_sources"],
+                            diagnostics["action_urls"],
                             diagnostics["url_citation_annotations"],
                             len(searched_urls),
+                            dropped_source_count,
+                            downgraded_claim_count,
                         )
-                        raise
                 return parsed
             except ValueError as exc:
                 last_error = exc
                 reason = _get(_get(response, "incomplete_details"), "reason")
                 if _get(response, "status") == "incomplete" and reason == "max_output_tokens":
+                    retry_floor = min(30.0, timeout_budget / 4)
+                    if deadline - asyncio.get_running_loop().time() < retry_floor:
+                        raise TimeoutError(
+                            "Research response was incomplete with too little time to retry."
+                        )
                     continue
                 raise
 
@@ -1934,10 +2043,13 @@ async def researcher_ai(
         else:
             error_code = "research_model_failure"
         logger.error(
-            "Research request failed; error_id=%s error_code=%s error_type=%s",
+            "Research request failed; error_id=%s error_code=%s error_type=%s "
+            "elapsed_seconds=%.1f timeout_seconds=%.1f",
             error_id,
             error_code,
             type(exc).__name__,
+            asyncio.get_running_loop().time() - started_at,
+            timeout_budget,
         )
         return {
             "error": (
@@ -2096,10 +2208,26 @@ def validate_ai_bias(ai: dict, source_text: str | None = None) -> AIresultBias:
     """Validate and normalize bias JSON before sending to frontend."""
     try:
         result = AIresultBias(**ai)
-        if source_text is not None and any(
-            phrase not in source_text for phrase in result.highlights
-        ):
-            raise ValueError("Bias highlights must be exact substrings of the analyzed text.")
+        if source_text is not None:
+            valid_pairs = [
+                (highlight, reason)
+                for highlight, reason in zip(
+                    result.highlights, result.highlight_reasons
+                )
+                if highlight in source_text
+            ]
+            dropped_count = len(result.highlights) - len(valid_pairs)
+            if dropped_count:
+                logger.warning(
+                    "Dropped non-verbatim bias highlights; dropped_count=%s",
+                    dropped_count,
+                )
+                result = result.model_copy(
+                    update={
+                        "highlights": [highlight for highlight, _ in valid_pairs],
+                        "highlight_reasons": [reason for _, reason in valid_pairs],
+                    }
+                )
         return result
     except Exception as exc:
         raise HTTPException(status_code=502, detail="AI bias response malformed.") from exc
@@ -2254,6 +2382,30 @@ def no_factual_research_result(
             candidate_claim_count=0,
             checked_claim_count=0,
             total_factual_characters=0,
+            article_input_truncated=article_input_truncated,
+        ),
+    )
+
+
+def unavailable_research_result(
+    *,
+    candidate_claim_count: int,
+    total_factual_characters: int,
+    article_input_truncated: bool = False,
+) -> AIresultResearch:
+    """Return a transparent partial result when external research is unavailable."""
+    return AIresultResearch(
+        claims=[],
+        overall_reliability="not_assessed",
+        notes=(
+            "External source verification was unavailable for this run, so no "
+            "research verdicts or source links are shown. Classification and bias "
+            "results remain available."
+        ),
+        coverage=_research_coverage(
+            candidate_claim_count=candidate_claim_count,
+            checked_claim_count=0,
+            total_factual_characters=total_factual_characters,
             article_input_truncated=article_input_truncated,
         ),
     )
@@ -2431,20 +2583,39 @@ async def run_article_job(job_id: str, request: ArticleJobRequest) -> None:
                 bias_result=bias_result,
                 candidate_claim_count=candidate_claim_count,
                 article_input_truncated=article_input_truncated,
+                timeout_seconds=OPENAI_BACKGROUND_RESEARCH_TIMEOUT_SECONDS,
             )
             if "error" in research_raw:
                 detail = model_error_detail(research_raw, "Research verification failed.")
-                raise ArticleJobFailure(
-                    detail["message"],
+                logger.warning(
+                    "Article research unavailable; job_id=%s error_code=%s reference=%s",
+                    job_id,
                     detail.get("code", "article_research_failed"),
-                    detail.get("reference"),
+                    detail.get("reference", "unavailable"),
                 )
-            research_result = validate_ai_research(
-                research_raw,
-                candidate_claim_count=candidate_claim_count,
-                total_factual_characters=len(factual_text),
-                article_input_truncated=article_input_truncated,
-            )
+                research_result = unavailable_research_result(
+                    candidate_claim_count=candidate_claim_count,
+                    total_factual_characters=len(factual_text),
+                    article_input_truncated=article_input_truncated,
+                )
+            else:
+                try:
+                    research_result = validate_ai_research(
+                        research_raw,
+                        candidate_claim_count=candidate_claim_count,
+                        total_factual_characters=len(factual_text),
+                        article_input_truncated=article_input_truncated,
+                    )
+                except HTTPException:
+                    logger.warning(
+                        "Article research response was malformed; job_id=%s",
+                        job_id,
+                    )
+                    research_result = unavailable_research_result(
+                        candidate_claim_count=candidate_claim_count,
+                        total_factual_characters=len(factual_text),
+                        article_input_truncated=article_input_truncated,
+                    )
         else:
             research_result = no_factual_research_result(article_input_truncated)
 
@@ -3126,6 +3297,7 @@ async def analyze_podcast_transcript(
             article_input_truncated=total_fact_chars > len(research_text),
             speaker_spans=research_speakers,
             source_kind="podcast",
+            timeout_seconds=OPENAI_BACKGROUND_RESEARCH_TIMEOUT_SECONDS,
         )
         if "error" in raw_research:
             raise ValueError("Podcast research verification failed.")

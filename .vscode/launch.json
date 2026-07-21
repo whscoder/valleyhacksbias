@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug FactGPT Backend",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/back-end/home.py",
+      "cwd": "${workspaceFolder}/back-end",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "HOST": "127.0.0.1",
+        "PORT": "8000",
+        "FACTGPT_REQUIRE_API_TOKEN": "false",
+        "FACTGPT_REQUIRE_ALLOWED_ORIGIN": "false"
+      }
+    }
+  ]
+}
