@@ -5,6 +5,8 @@ import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from fastapi import HTTPException
+
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
 
 import home
@@ -69,8 +71,8 @@ class QuoteParsingTests(unittest.TestCase):
         self.assertEqual([location["line"] for location in locations], [2, 2])
         self.assertEqual([location["column"] for location in locations], [8, 14])
 
-    def test_analyze_bias_sends_external_quote_spans_to_model(self):
-        text = 'The source called it "a total disaster."'
+    def test_analyze_bias_removes_external_quotes_before_model_scoring(self):
+        text = 'The source called it "a total disaster." The report was published.'
         model_response = {"output_text": '{"parsed": true}'}
 
         with patch.object(home, "run_model_json", new=AsyncMock(return_value=model_response)) as run:
@@ -78,12 +80,32 @@ class QuoteParsingTests(unittest.TestCase):
 
         self.assertEqual(result, {"parsed": True})
         sent_payload = run.await_args.kwargs["payload"]
-        self.assertEqual(sent_payload["article_text"], text)
-        self.assertEqual(sent_payload["quoted_spans"][0]["text"], "a total disaster.")
-        self.assertEqual(
-            sent_payload["quoted_spans"][0]["attribution"],
-            "external_speaker_or_author",
+        self.assertNotIn("a total disaster.", sent_payload["article_text"])
+        self.assertIn("The report was published.", sent_payload["article_text"])
+        self.assertEqual(sent_payload["quoted_spans"], [])
+
+    def test_analyze_bias_removes_multiline_and_multiple_quotes(self):
+        text = (
+            'The witness said “This is\nvery bad.” The agency replied '
+            '"the review is complete." The report was published.'
         )
+        model_response = {"output_text": '{"parsed": true}'}
+
+        with patch.object(home, "run_model_json", new=AsyncMock(return_value=model_response)) as run:
+            asyncio.run(home.analyze_bias(text))
+
+        scored = run.await_args.kwargs["payload"]["article_text"]
+        self.assertNotIn("This is\nvery bad.", scored)
+        self.assertNotIn("the review is complete.", scored)
+        self.assertIn("The report was published.", scored)
+
+    def test_quote_cannot_be_returned_as_a_bias_highlight(self):
+        scored_text = "The report was published."
+        model_result = home.no_factual_bias_result().model_dump(mode="json")
+        model_result["highlights"] = ["a total disaster."]
+
+        with self.assertRaises(HTTPException):
+            home.validate_ai_bias(model_result, scored_text)
 
     def test_analyze_bias_timeout_returns_retryable_error(self):
         async def never_finishes(**_kwargs):

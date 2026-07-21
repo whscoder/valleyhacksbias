@@ -45,19 +45,36 @@ def research_output(*claims: dict) -> dict:
     }
 
 
-def web_response(parsed: dict, *urls: str) -> dict:
+def web_response(parsed: dict, *urls: str, annotation_urls: tuple[str, ...] = ()) -> dict:
+    output = [
+        {
+            "type": "web_search_call",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "sources": [{"type": "url", "url": url} for url in urls],
+            },
+        }
+    ]
+    if annotation_urls:
+        output.append(
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": json.dumps(parsed),
+                        "annotations": [
+                            {"type": "url_citation", "url": url}
+                            for url in annotation_urls
+                        ],
+                    }
+                ],
+            }
+        )
     return {
         "output_text": json.dumps(parsed),
-        "output": [
-            {
-                "type": "web_search_call",
-                "status": "completed",
-                "action": {
-                    "type": "search",
-                    "sources": [{"type": "url", "url": url} for url in urls],
-                },
-            }
-        ],
+        "output": output,
     }
 
 
@@ -130,9 +147,10 @@ class ResearchToolOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(result, parsed)
         call = run.await_args.kwargs
-        self.assertEqual(call["tools"], [{"type": "web_search_preview"}])
-        self.assertEqual(call["tool_choice"], {"type": "web_search_preview"})
+        self.assertEqual(call["tools"], [{"type": "web_search"}])
+        self.assertEqual(call["tool_choice"], {"type": "web_search"})
         self.assertEqual(call["include"], ["web_search_call.action.sources"])
+        self.assertEqual(call["model"], "gpt-5.5")
         self.assertEqual(
             call["payload"]["bias_detector_output"], bias.model_dump(mode="json")
         )
@@ -158,6 +176,30 @@ class ResearchToolOrchestrationTests(unittest.TestCase):
     def test_research_rejects_citation_absent_from_web_results(self):
         parsed = research_output(research_claim(url="https://invented.example/report"))
         response = web_response(parsed, "https://example.gov/report")
+
+        with patch.object(
+            home, "run_model_json", new=AsyncMock(return_value=response)
+        ):
+            result = asyncio.run(home.researcher_ai("A factual statement."))
+
+        self.assertEqual(result["error_code"], "research_unverified_citation")
+
+    def test_research_accepts_url_citation_annotations_without_action_sources(self):
+        parsed = research_output(research_claim(url="https://EXAMPLE.gov/report/"))
+        response = web_response(
+            parsed, annotation_urls=("https://example.gov/report",)
+        )
+
+        with patch.object(
+            home, "run_model_json", new=AsyncMock(return_value=response)
+        ):
+            result = asyncio.run(home.researcher_ai("A factual statement."))
+
+        self.assertEqual(result, parsed)
+
+    def test_research_rejects_completed_search_without_citations(self):
+        parsed = research_output(research_claim())
+        response = web_response(parsed)
 
         with patch.object(
             home, "run_model_json", new=AsyncMock(return_value=response)
@@ -195,6 +237,60 @@ class ResearchToolOrchestrationTests(unittest.TestCase):
         self.assertIsInstance(supplied_bias, home.AIresultBias)
         self.assertEqual(supplied_bias.model_dump(mode="json"), bias_output)
         self.assertEqual(response["ai_research"].coverage.status, "partial")
+
+    def test_article_job_keeps_bias_partial_result_when_research_provenance_fails(self):
+        text = ("The published rate was four percent. " * 8).strip()
+        classification = make_result(
+            text, [("fact", []) for _ in home.segment_article(text)]
+        )
+        job_id = "research-partial-test"
+        home.article_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "result": None,
+            "error": None,
+        }
+        request = home.ArticleJobRequest(
+            page_url="https://example.gov/article", text=text, title="Rates"
+        )
+
+        try:
+            with (
+                patch.object(
+                    home,
+                    "classify_article_fact_opinion",
+                    new=AsyncMock(return_value=classification),
+                ),
+                patch.object(
+                    home,
+                    "analyze_bias",
+                    new=AsyncMock(
+                        return_value=home.no_factual_bias_result().model_dump(mode="json")
+                    ),
+                ),
+                patch.object(
+                    home,
+                    "researcher_ai",
+                    new=AsyncMock(
+                        return_value={
+                            "error": "Research verification failed. Please try again.",
+                            "error_code": "research_unverified_citation",
+                            "error_id": "safe-reference",
+                        }
+                    ),
+                ),
+            ):
+                asyncio.run(home.run_article_job(job_id, request))
+
+            job = home.article_jobs[job_id]
+            self.assertEqual(job["status"], "failed")
+            self.assertEqual(
+                job["error"]["code"], "research_unverified_citation"
+            )
+            self.assertIsNotNone(job["result"]["ai_result"])
+            self.assertEqual(job["result"]["status"], "partial")
+        finally:
+            home.article_jobs.pop(job_id, None)
 
 
 if __name__ == "__main__":

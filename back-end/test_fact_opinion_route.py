@@ -421,6 +421,22 @@ class FactOpinionPipelineTests(unittest.TestCase):
         self.assertIn("costs four million dollars", research_text)
         self.assertIn("reckless", bias_text)
 
+    def test_bias_content_excludes_quote_crossing_classified_segments(self):
+        text = (
+            'The official said “The proposal is\na disaster. It will fail.” '
+            'The proposal costs four million dollars.'
+        )
+        result = make_result(
+            text, [("fact", []) for _ in home.segment_article(text)]
+        )
+
+        bias_text, bias_quotes = home.build_bias_content(result, text)
+
+        self.assertNotIn("The proposal is\na disaster.", bias_text)
+        self.assertNotIn("It will fail.", bias_text)
+        self.assertIn("The proposal costs four million dollars.", bias_text)
+        self.assertEqual(bias_quotes, [])
+
     def test_research_reuses_matching_classification(self):
         text = ("The rate was four percent. " * 10).strip()
         result = make_result(text, [("fact", []) for _ in home.segment_article(text)])

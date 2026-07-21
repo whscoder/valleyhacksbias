@@ -185,6 +185,7 @@ def extract_quoted_phrases(
 # Centralized runtime settings keep thresholds easy to tune.
 MODEL_NAME = "gpt-4o-mini"
 FACT_OPINION_API_MODEL = "gpt-5.6-sol"
+RESEARCH_API_MODEL = "gpt-5.5"
 MIN_EXTRACT_CHARS = 200
 MAX_RESEARCH_INPUT_CHARS = 6000
 MAX_ANALYSIS_INPUT_CHARS = 12000
@@ -1223,13 +1224,57 @@ def build_bias_content(
     article_text: str,
     max_chars: int = MAX_ANALYSIS_INPUT_CHARS,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Keep mixed opinion wording visible to bias analysis, excluding pure opinions."""
-    return build_factual_content(
+    """Return article-authored factual/mixed text, excluding external quotations."""
+    bias_text, quoted_spans = build_factual_content(
         result,
         article_text,
         max_chars,
         retain_mixed_opinion=True,
     )
+    return _remove_external_quotes(bias_text, quoted_spans), []
+
+
+def _remove_external_quotes(
+    text: str, quoted_spans: list[dict[str, Any]]
+) -> str:
+    """Remove exact externally attributed quote ranges while preserving article flow."""
+    ranges: list[tuple[int, int]] = []
+    for span in quoted_spans:
+        try:
+            start = max(0, int(span["start_offset"]))
+            end = min(len(text), int(span["end_offset"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start >= end:
+            continue
+        # Quote spans describe their content, so also consume adjoining delimiters.
+        if start > 0 and text[start - 1] in QUOTE_MARKS:
+            start -= 1
+        if end < len(text) and text[end] in QUOTE_MARKS:
+            end += 1
+        ranges.append((start, end))
+
+    if not ranges:
+        return text.strip()
+
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        pieces.append(text[cursor:start])
+        cursor = end
+    pieces.append(text[cursor:])
+    # Do not collapse line breaks: they remain useful for later highlight offsets.
+    without_quotes = "".join(pieces)
+    without_quotes = re.sub(r"[ \t]{2,}", " ", without_quotes)
+    without_quotes = re.sub(r"[ \t]*\n[ \t]*", "\n", without_quotes)
+    without_quotes = re.sub(r"\s+([,.;:!?])", r"\1", without_quotes)
+    return without_quotes.strip()
 
 
 def build_factual_text(
@@ -1565,14 +1610,22 @@ async def analyze_bias(
     source_kind: Literal["article", "podcast"] = "article",
 ) -> dict:
     """Run the bias prompt and return parsed JSON (or {error})."""
+    external_quotes = (
+        quoted_spans if quoted_spans is not None else extract_quoted_phrases(text)
+    )
+    bias_text = (
+        _remove_external_quotes(text, external_quotes)
+        if source_kind == "article"
+        else text
+    )
     payload = {
         "task": "bias_analysis",
         "title": title,
-        "article_text": text,
+        "article_text": bias_text,
         "source_kind": source_kind,
-        "quoted_spans": (
-            quoted_spans if quoted_spans is not None else extract_quoted_phrases(text)
-        ),
+        # Quotes are useful provenance for research, but are intentionally not
+        # available to article bias scoring.
+        "quoted_spans": [] if source_kind == "article" else external_quotes,
         "speaker_spans": speaker_spans or [],
         "return": "valid JSON only",
     }
@@ -1676,23 +1729,62 @@ def _normalize_provenance_url(value: Any) -> str | None:
     return urlunsplit((parsed.scheme.lower(), hostname, path, parsed.query, ""))
 
 
+def _web_search_provenance_diagnostics(response: Any) -> dict[str, int]:
+    """Return safe, payload-free counts for web-search provenance diagnostics."""
+    completed_searches = 0
+    action_sources = 0
+    annotations = 0
+    for item in _get(response, "output", []) or []:
+        if _get(item, "type") == "web_search_call" and _get(item, "status") == "completed":
+            completed_searches += 1
+            action_sources += len(_get(_get(item, "action", {}), "sources", []) or [])
+        if _get(item, "type") == "message":
+            for content in _get(item, "content", []) or []:
+                annotations += sum(
+                    _get(annotation, "type") == "url_citation"
+                    for annotation in (_get(content, "annotations", []) or [])
+                )
+    return {
+        "completed_searches": completed_searches,
+        "action_sources": action_sources,
+        "url_citation_annotations": annotations,
+    }
+
+
+def _has_completed_web_search(response: Any) -> bool:
+    """Return whether this response completed the required web-search tool call."""
+    return _web_search_provenance_diagnostics(response)["completed_searches"] > 0
+
+
 def _completed_web_search_urls(response: Any) -> set[str]:
-    """Collect URLs actually returned/opened by completed web-search calls."""
-    urls: set[str] = set()
+    """Collect provenance URLs from completed web searches and their citations."""
+    source_urls: set[str] = set()
     for item in _get(response, "output", []) or []:
         if _get(item, "type") != "web_search_call":
             continue
         if _get(item, "status") != "completed":
             continue
         action = _get(item, "action", {})
-        direct_url = _normalize_provenance_url(_get(action, "url"))
-        if direct_url:
-            urls.add(direct_url)
         for source in _get(action, "sources", []) or []:
             source_url = _normalize_provenance_url(_get(source, "url"))
             if source_url:
-                urls.add(source_url)
-    return urls
+                source_urls.add(source_url)
+
+    if not _has_completed_web_search(response):
+        return set()
+
+    annotation_urls: set[str] = set()
+    for item in _get(response, "output", []) or []:
+        if _get(item, "type") != "message":
+            continue
+        for content in _get(item, "content", []) or []:
+            for annotation in _get(content, "annotations", []) or []:
+                if _get(annotation, "type") != "url_citation":
+                    continue
+                citation_url = _normalize_provenance_url(_get(annotation, "url"))
+                if citation_url:
+                    annotation_urls.add(citation_url)
+    return source_urls | annotation_urls
 
 
 def _validate_research_url_provenance(
@@ -1778,9 +1870,10 @@ async def researcher_ai(
                     schema_name="research_schema",
                     schema=research_schema[0],
                     max_tokens=max_tokens,
-                    tools=[{"type": "web_search_preview"}],
-                    tool_choice={"type": "web_search_preview"},
+                    tools=[{"type": "web_search"}],
+                    tool_choice={"type": "web_search"},
                     include=["web_search_call.action.sources"],
+                    model=RESEARCH_API_MODEL,
                     timeout=remaining_seconds,
                 ),
                 timeout=remaining_seconds,
@@ -1790,12 +1883,31 @@ async def researcher_ai(
                 # Real Responses SDK objects always expose output. Keeping the
                 # guard conditional permits small unit-test response doubles.
                 if _get(response, "output") is not None:
-                    searched_urls = _completed_web_search_urls(response)
-                    if not searched_urls:
+                    diagnostics = _web_search_provenance_diagnostics(response)
+                    if not _has_completed_web_search(response):
+                        logger.warning(
+                            "Research provenance rejected; category=no_completed_search "
+                            "completed_searches=%d action_sources=%d url_citation_annotations=%d",
+                            diagnostics["completed_searches"],
+                            diagnostics["action_sources"],
+                            diagnostics["url_citation_annotations"],
+                        )
                         raise MissingWebSearchError(
                             "Research response did not complete a web search."
                         )
-                    _validate_research_url_provenance(parsed, searched_urls)
+                    searched_urls = _completed_web_search_urls(response)
+                    try:
+                        _validate_research_url_provenance(parsed, searched_urls)
+                    except ResearchCitationProvenanceError:
+                        logger.warning(
+                            "Research provenance rejected; category=unverified_citation "
+                            "completed_searches=%d action_sources=%d url_citation_annotations=%d canonical_urls=%d",
+                            diagnostics["completed_searches"],
+                            diagnostics["action_sources"],
+                            diagnostics["url_citation_annotations"],
+                            len(searched_urls),
+                        )
+                        raise
                 return parsed
             except ValueError as exc:
                 last_error = exc

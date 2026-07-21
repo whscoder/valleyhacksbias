@@ -70,4 +70,12 @@ cd back-end
 ../.venv/bin/python evaluate_openai_fallback.py --dry-run
 ```
 
+To make three paid staging requests that exercise the live Responses web-search
+integration, opt in explicitly with a non-production key:
+
+```bash
+cd back-end
+FACTGPT_RUN_LIVE_RESEARCH_SMOKE=1 ../.venv/bin/python research_live_smoke.py
+```
+
 Omit `--dry-run` only when you intend to make paid API requests; the run writes a JSON report under `back-end/testingcode/reports/`.

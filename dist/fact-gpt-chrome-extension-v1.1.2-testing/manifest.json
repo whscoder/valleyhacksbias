@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Fact GPT",
+  "version": "1.1.2",
+  "description": "Analyzes news articles and open-web podcasts for bias and reliability.",
+  "action": {
+    "default_title": "Fact GPT",
+    "default_popup": "extension.html"
+  },
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "scripting",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "host_permissions": [
+    "https://bias-article-detector.onrender.com/*"
+  ]
+}
