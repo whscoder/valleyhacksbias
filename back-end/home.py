@@ -246,6 +246,12 @@ MAX_OPENAI_CLASSIFICATION_ITEMS = 25
 MAX_OPENAI_CLASSIFICATION_CHARS = 6_000
 OPENAI_CLASSIFICATION_TIMEOUT_SECONDS = 45
 OPENAI_CLASSIFICATION_TOKEN_LIMITS = (4_000, 6_000)
+OPENAI_BIAS_TIMEOUT_SECONDS = float(
+    os.getenv("FACTGPT_OPENAI_BIAS_TIMEOUT_SECONDS", "60")
+)
+OPENAI_RESEARCH_TIMEOUT_SECONDS = float(
+    os.getenv("FACTGPT_OPENAI_RESEARCH_TIMEOUT_SECONDS", "120")
+)
 MAX_PODCAST_AUDIO_BYTES = int(
     os.getenv("FACTGPT_MAX_PODCAST_AUDIO_BYTES", "200000000")
 )
@@ -1544,27 +1550,38 @@ async def analyze_bias(
         "return": "valid JSON only",
     }
     try:
-        response = await run_model_json(
-            prompt=bias_detector_prompt,
-            payload=payload,
-            schema_name="bias_result",
-            schema=bias_schema[0]["parameters"],
-            max_tokens=1800,
-            temperature=0.2,
+        response = await asyncio.wait_for(
+            run_model_json(
+                prompt=bias_detector_prompt,
+                payload=payload,
+                schema_name="bias_result",
+                schema=bias_schema[0]["parameters"],
+                max_tokens=1800,
+                temperature=0.2,
+                timeout=OPENAI_BIAS_TIMEOUT_SECONDS,
+            ),
+            timeout=OPENAI_BIAS_TIMEOUT_SECONDS,
         )
         return parse_model_json(response)
     except Exception as exc:
         error_id = hashlib.sha256(
             f"{time.time_ns()}:{type(exc).__name__}".encode("utf-8")
         ).hexdigest()[:12]
+        timed_out = isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+        error_code = "bias_timeout" if timed_out else "bias_model_failure"
         logger.error(
-            "Bias request failed; error_id=%s error_code=bias_model_failure error_type=%s",
+            "Bias request failed; error_id=%s error_code=%s error_type=%s",
             error_id,
+            error_code,
             type(exc).__name__,
         )
         return {
-            "error": "Bias analysis failed. Please try again.",
-            "error_code": "bias_model_failure",
+            "error": (
+                "Bias analysis timed out. Please try again."
+                if timed_out
+                else "Bias analysis failed. Please try again."
+            ),
+            "error_code": error_code,
             "error_id": error_id,
         }
 
@@ -1718,17 +1735,28 @@ async def researcher_ai(
 
     try:
         last_error: Exception | None = None
+        deadline = (
+            asyncio.get_running_loop().time()
+            + OPENAI_RESEARCH_TIMEOUT_SECONDS
+        )
         for max_tokens in (1800, 2600):
             # Retry once with more output tokens if the model truncates.
-            response = await run_model_json(
-                prompt=researcher_prompt,
-                payload=payload,
-                schema_name="research_schema",
-                schema=research_schema[0],
-                max_tokens=max_tokens,
-                tools=[{"type": "web_search_preview"}],
-                tool_choice={"type": "web_search_preview"},
-                include=["web_search_call.action.sources"],
+            remaining_seconds = deadline - asyncio.get_running_loop().time()
+            if remaining_seconds <= 0:
+                raise TimeoutError("Research exceeded its time limit.")
+            response = await asyncio.wait_for(
+                run_model_json(
+                    prompt=researcher_prompt,
+                    payload=payload,
+                    schema_name="research_schema",
+                    schema=research_schema[0],
+                    max_tokens=max_tokens,
+                    tools=[{"type": "web_search_preview"}],
+                    tool_choice={"type": "web_search_preview"},
+                    include=["web_search_call.action.sources"],
+                    timeout=remaining_seconds,
+                ),
+                timeout=remaining_seconds,
             )
             try:
                 parsed = parse_model_json(response)
@@ -1756,7 +1784,9 @@ async def researcher_ai(
         error_id = hashlib.sha256(
             f"{time.time_ns()}:{type(exc).__name__}".encode("utf-8")
         ).hexdigest()[:12]
-        if isinstance(exc, MissingWebSearchError):
+        if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+            error_code = "research_timeout"
+        elif isinstance(exc, MissingWebSearchError):
             error_code = "research_no_web_search"
         elif isinstance(exc, ResearchCitationProvenanceError):
             error_code = "research_unverified_citation"
@@ -1771,7 +1801,11 @@ async def researcher_ai(
             type(exc).__name__,
         )
         return {
-            "error": "Research verification failed. Please try again.",
+            "error": (
+                "Research timed out. Please try again."
+                if error_code == "research_timeout"
+                else "Research verification failed. Please try again."
+            ),
             "error_code": error_code,
             "error_id": error_id,
         }

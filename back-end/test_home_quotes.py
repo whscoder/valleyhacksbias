@@ -85,6 +85,19 @@ class QuoteParsingTests(unittest.TestCase):
             "external_speaker_or_author",
         )
 
+    def test_analyze_bias_timeout_returns_retryable_error(self):
+        async def never_finishes(**_kwargs):
+            await asyncio.sleep(1)
+
+        with (
+            patch.object(home, "OPENAI_BIAS_TIMEOUT_SECONDS", 0.01),
+            patch.object(home, "run_model_json", side_effect=never_finishes),
+        ):
+            result = asyncio.run(home.analyze_bias("A factual passage long enough to analyze."))
+
+        self.assertEqual(result["error_code"], "bias_timeout")
+        self.assertIn("timed out", result["error"].lower())
+
     def test_research_sends_truncated_external_quote_spans_to_model(self):
         text = 'The source said "external words."'
         model_response = {"output_text": '{"parsed": true}'}
@@ -96,6 +109,19 @@ class QuoteParsingTests(unittest.TestCase):
         sent_payload = run.await_args.kwargs["payload"]
         self.assertEqual(sent_payload["content_text"], text)
         self.assertEqual(sent_payload["quoted_spans"][0]["text"], "external words.")
+
+    def test_research_timeout_returns_retryable_error(self):
+        async def never_finishes(**_kwargs):
+            await asyncio.sleep(1)
+
+        with (
+            patch.object(home, "OPENAI_RESEARCH_TIMEOUT_SECONDS", 0.01),
+            patch.object(home, "run_model_json", side_effect=never_finishes),
+        ):
+            result = asyncio.run(home.researcher_ai("A factual passage long enough to research."))
+
+        self.assertEqual(result["error_code"], "research_timeout")
+        self.assertIn("timed out", result["error"].lower())
 
 
 if __name__ == "__main__":

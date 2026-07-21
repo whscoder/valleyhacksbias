@@ -1,6 +1,8 @@
 // Low-level HTTP adapter: tries configured backends and normalizes error bodies.
 import { BACKEND_BASE_URLS } from "./config.js";
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+
 function buildBackendUrl(baseUrl, endpoint) {
   const normalizedBase = String(baseUrl ?? "").replace(/\/+$/, "");
   const normalizedEndpoint = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
@@ -31,18 +33,42 @@ export function formatBackendErrorDetail(value, fallback) {
   return String(value || fallback || "Request failed.").trim();
 }
 
-export async function requestBackend(endpoint, init = {}) {
+export async function requestBackend(endpoint, init = {}, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
   let lastError = null;
 
   // Fail over only when a base URL is unreachable. An HTTP response proves that
   // the backend was reached, so surface its error instead of retrying elsewhere.
   for (const baseUrl of BACKEND_BASE_URLS) {
     let response;
+    const controller = new AbortController();
+    const upstreamSignal = init.signal;
+    let timedOut = false;
+    const abortFromUpstream = () => controller.abort(upstreamSignal.reason);
+    if (upstreamSignal?.aborted) {
+      abortFromUpstream();
+    } else {
+      upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
+    }
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, Math.max(1, Number(timeoutMs) || DEFAULT_REQUEST_TIMEOUT_MS));
     try {
-      response = await fetch(buildBackendUrl(baseUrl, endpoint), init);
+      response = await fetch(buildBackendUrl(baseUrl, endpoint), {
+        ...init,
+        signal: controller.signal
+      });
     } catch (error) {
-      lastError = error;
+      if (upstreamSignal?.aborted) {
+        throw error;
+      }
+      lastError = timedOut
+        ? new Error("The analysis service timed out. Please try again.")
+        : error;
       continue;
+    } finally {
+      clearTimeout(timeoutId);
+      upstreamSignal?.removeEventListener("abort", abortFromUpstream);
     }
 
     const { json, text } = await readResponseBody(response);

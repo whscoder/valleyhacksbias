@@ -38,8 +38,38 @@ async function purgeLegacyAnalysisCache() {
   }
 }
 
-purgeLegacyAnalysisCache().catch((error) => {
-  console.debug("Legacy analysis cache cleanup skipped:", normalizeText(error.message, "cleanup failed"));
+async function recoverInterruptedArticleJobs() {
+  // Article work lives in this service worker, unlike backend-owned podcast
+  // jobs. If the worker starts with a persisted running article state, there is
+  // no in-memory promise left to finish it, so make retry available immediately.
+  const allData = await chrome.storage.local.get(null);
+  const recovered = {};
+  for (const [key, value] of Object.entries(allData)) {
+    if (!key.startsWith(ANALYSIS_PREFIX) || !value || typeof value !== "object") {
+      continue;
+    }
+    if (!["running", "queued"].includes(String(value.status || "").toLowerCase())) {
+      continue;
+    }
+    recovered[key] = {
+      ...value,
+      status: "error",
+      stage: "Previous analysis was interrupted.",
+      completedAt: Date.now(),
+      updatedAt: Date.now(),
+      error: "The previous analysis stopped before finishing. Run it again."
+    };
+  }
+  if (Object.keys(recovered).length) {
+    await chrome.storage.local.set(recovered);
+  }
+}
+
+const startupReady = Promise.all([
+  purgeLegacyAnalysisCache(),
+  recoverInterruptedArticleJobs()
+]).catch((error) => {
+  console.debug("Analysis cache startup cleanup skipped:", normalizeText(error.message, "cleanup failed"));
 });
 
 function normalizeText(value, fallback = "") {
@@ -376,12 +406,12 @@ async function extractVisibleTextFromTab(tabId) {
   return String(injection?.result ?? "").trim();
 }
 
-async function extractArticleText(url, tabId, key) {
+async function extractArticleText(url, tabId, key, signal) {
   // Prefer the cheapest backend extraction first. The DOM and rendered paths are
   // fallbacks for pages that block direct fetches or render content with JS.
   try {
     await saveAnalysisState(key, { stage: "Extracting readable text..." });
-    const data = await extractArticleFromUrl(url);
+    const data = await extractArticleFromUrl(url, signal);
     const text = normalizeArticleText(data.text, "");
     if (text.length >= MIN_TEXT_CHARS) {
       return text;
@@ -408,7 +438,7 @@ async function extractArticleText(url, tabId, key) {
   }
 
   await saveAnalysisState(key, { stage: "Trying browser-rendered extraction..." });
-  const rendered = await extractRenderedArticleFromUrl(url);
+  const rendered = await extractRenderedArticleFromUrl(url, signal);
   const renderedText = normalizeArticleText(rendered.text, "");
   if (renderedText.length < MIN_TEXT_CHARS) {
     throw new Error("Not enough readable text found on this page.");
@@ -416,7 +446,7 @@ async function extractArticleText(url, tabId, key) {
   return renderedText;
 }
 
-async function runAnalysisJob({ key, url, tabId }) {
+async function runAnalysisJob({ key, url, tabId, signal }) {
   // The background worker owns long-running backend work. The popup only starts
   // the job and later reads this saved state, so closing the popup does not
   // immediately kill the analysis flow.
@@ -434,10 +464,10 @@ async function runAnalysisJob({ key, url, tabId }) {
   });
 
   try {
-    const articleText = await extractArticleText(url, tabId, key);
+    const articleText = await extractArticleText(url, tabId, key, signal);
 
-    await saveAnalysisState(key, { stage: "Running quick bias scan..." });
-    const biasResult = await analyzeBiasText(articleText);
+    await saveAnalysisState(key, { stage: "Classifying passages and analyzing bias..." });
+    const biasResult = await analyzeBiasText(articleText, "Article Analysis", signal);
     const aiBias = biasResult.ai_result || {};
     const factOpinion = biasResult.fact_opinion || null;
 
@@ -458,7 +488,8 @@ async function runAnalysisJob({ key, url, tabId }) {
         articleText,
         "Article Analysis",
         factOpinion,
-        aiBias
+        aiBias,
+        signal
       );
       const finalFactOpinion = researchResult.fact_opinion || factOpinion;
 
@@ -474,6 +505,9 @@ async function runAnalysisJob({ key, url, tabId }) {
         partialResult: null
       });
     } catch (error) {
+      if (signal?.aborted) {
+        throw error;
+      }
       await saveAnalysisState(key, {
         status: "partial",
         stage: "Bias complete. Sources unavailable right now.",
@@ -488,15 +522,37 @@ async function runAnalysisJob({ key, url, tabId }) {
       });
     }
   } catch (error) {
+    if (signal?.aborted) {
+      return;
+    }
     await saveAnalysisState(key, {
       status: "error",
       stage: "Analysis failed.",
       completedAt: Date.now(),
       error: normalizeText(error.message, "Analysis failed.")
     });
-  } finally {
-    runningJobs.delete(key);
   }
+}
+
+function startAnalysisJob({ key, url, tabId }) {
+  // A manual Analyze click is also a recovery action. Abort any request that
+  // survived in this worker after its persisted state became stale, then start
+  // a fresh run. The identity guard prevents the old promise from deleting the
+  // replacement job when its abort finishes.
+  runningJobs.get(key)?.controller.abort();
+  const controller = new AbortController();
+  let promise;
+  promise = runAnalysisJob({
+    key,
+    url,
+    tabId,
+    signal: controller.signal
+  }).finally(() => {
+    if (runningJobs.get(key)?.promise === promise) {
+      runningJobs.delete(key);
+    }
+  });
+  runningJobs.set(key, { controller, promise });
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -514,10 +570,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message?.type === "FACTGPT_START_ANALYSIS") {
     const key = buildAnalysisKey(message.url);
-    if (!runningJobs.has(key)) {
-      const job = runAnalysisJob({ key, url: message.url, tabId: message.tabId });
-      runningJobs.set(key, job);
-    }
+    startupReady.then(() => {
+      startAnalysisJob({ key, url: message.url, tabId: message.tabId });
+    });
     sendResponse({ ok: true, key });
     return false;
   }

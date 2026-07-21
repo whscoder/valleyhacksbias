@@ -5,7 +5,7 @@ import {
   factOpinionPresentation,
   normalizeResearchPresentation
 } from "./parseScript.js";
-import { formatBackendErrorDetail } from "./api.js";
+import { formatBackendErrorDetail, requestBackend } from "./api.js";
 
 const mixedItem = {
   id: "mixed-1",
@@ -118,5 +118,20 @@ assert.equal(
   }),
   "Research verification failed. Code: research_no_web_search Reference: abc123"
 );
+
+const originalFetch = globalThis.fetch;
+globalThis.fetch = (_url, init) => new Promise((_resolve, reject) => {
+  init.signal.addEventListener("abort", () => {
+    reject(new Error("aborted"));
+  }, { once: true });
+});
+try {
+  await assert.rejects(
+    requestBackend("/health", {}, 5),
+    /analysis service timed out/i
+  );
+} finally {
+  globalThis.fetch = originalFetch;
+}
 
 console.log("Frontend presenter contract tests passed.");

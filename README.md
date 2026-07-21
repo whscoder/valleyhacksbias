@@ -57,6 +57,7 @@ cd back-end
 cd ..
 node front-end/test_presenters.mjs
 node front-end/test_podcast_helpers.mjs
+node front-end/test_background_lifecycle.mjs
 docker build -t factgpt-podcast .
 docker run --rm --entrypoint sh factgpt-podcast -c 'ffmpeg -version && ffprobe -version'
 ```

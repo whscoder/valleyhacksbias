@@ -628,7 +628,7 @@ export async function parseText(url, updateStatus = () => {}, options = {}) {
     // Raw text path: popup may pass visible tab text directly after DOM fallback.
 
     thinking.setPhase("Evaluating language bias");
-    setStatus("Running quick bias scan...");
+    setStatus("Classifying passages and analyzing bias...");
     const biasResponse = await fetchBackend("/analyze-bias", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
