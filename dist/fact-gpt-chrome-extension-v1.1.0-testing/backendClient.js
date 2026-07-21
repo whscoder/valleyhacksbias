@@ -7,6 +7,7 @@ const ENDPOINTS = Object.freeze({
   extractRendered: "/extract-rendered",
   analyzeBias: "/analyze-bias",
   research: "/research",
+  articleJobs: "/article-jobs",
   podcastJobs: "/podcast-jobs"
 });
 
@@ -16,6 +17,7 @@ const TIMEOUTS = Object.freeze({
   extractRendered: 75_000,
   analyzeBias: 120_000,
   research: 180_000,
+  articleRequest: 45_000,
   podcastRequest: 45_000
 });
 
@@ -72,6 +74,25 @@ export function researchText(
     TIMEOUTS.research,
     signal
   );
+}
+
+export function createArticleJob(pageUrl, clientRequestId, text = "", title = "Article Analysis") {
+  return postJson(
+    ENDPOINTS.articleJobs,
+    {
+      page_url: String(pageUrl ?? "").trim(),
+      client_request_id: String(clientRequestId ?? "").trim(),
+      text: String(text ?? ""),
+      title: String(title ?? "Article Analysis").trim() || "Article Analysis"
+    },
+    TIMEOUTS.articleRequest
+  );
+}
+
+export function getArticleJob(jobId) {
+  return requestBackend(`${ENDPOINTS.articleJobs}/${encodeURIComponent(jobId)}`, {
+    method: "GET"
+  }, TIMEOUTS.articleRequest);
 }
 
 export function createPodcastJob(pageUrl, hints = {}) {

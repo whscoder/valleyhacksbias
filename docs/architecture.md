@@ -15,15 +15,12 @@ Per-page job state is stored in `chrome.storage.local`. The backend keeps proces
 ## End-to-end production flow
 
 1. `extension.html` loads `popup.js`. The popup finds the active tab, asks `background.js` for the normalized per-URL storage key, and restores any saved state.
-2. Clicking **Analyze Current Page** sends `FACTGPT_START_ANALYSIS` to the MV3 background service worker. The popup remains a view over saved state and watches `chrome.storage.local` for updates.
-3. The worker tries article extraction in this order:
-   - backend `POST /extract` using HTTPX and BeautifulSoup;
-   - visible DOM text injected into the still-matching active tab;
-   - backend `POST /extract-rendered` using headless Chromium.
+2. Clicking **Analyze Current Page** gives the run a unique request ID and sends `FACTGPT_START_ANALYSIS` to the MV3 background service worker. The worker reads visible DOM text when permitted and makes one idempotent `POST /article-jobs` request. It stores the returned job ID, responds to the popup, and retains no article timer, port, or detached job promise, so Chrome can terminate it after the event completes and the worker becomes idle.
+3. The backend-owned article job uses supplied DOM text when it is sufficient. Otherwise it tries direct HTTPX/BeautifulSoup extraction and then headless-Chromium rendered extraction. Repeating an ambiguous create request with the same request ID returns the same job.
 4. The backend segments the exact normalized article and runs the local fact/opinion classifier first. Low-confidence items, every exclusion-sensitive local opinion, and confident facts containing high-precision subjectivity cues go to OpenAI review. Final decisions are `fact`, `opinion`, `mixed`, or `unresolved` with an auditable basis.
-5. Pure opinions and unresolved passages are excluded from downstream factual analysis. Mixed passages retain their exact opinion wording for bias analysis, while those excerpts are masked for factual research. The worker saves bias results immediately.
-6. `POST /research` reuses the signed classification and receives the validated bias result for context. The Responses API is forced to complete web search; returned citations must come from that tool output, and decisive verdicts require an official, primary, or reputable secondary source. Server-derived coverage states how many candidate segments were checked, left unchecked, or truncated.
-7. `popup.js` rebuilds the view from storage. `parseScript.js` makes opinions visually explicit, gives mixed statements their own count/style, exposes expandable classifier confidence/triggers/basis, and groups every researched claim with its verdict, evidence, citations, relevance, reliability, and coverage. Clicking a bias phrase highlights it in the original tab.
+5. Pure opinions and unresolved passages are excluded from downstream factual analysis. Mixed passages retain their exact opinion wording for bias analysis, while those excerpts are masked for factual research. The backend job preserves partial bias output if later research fails.
+6. Research receives the validated bias result for context. The Responses API is forced to complete web search; returned citations must come from that tool output, and decisive verdicts require an official, primary, or reputable secondary source. Server-derived coverage states how many candidate segments were checked, left unchecked, or truncated.
+7. While open, `popup.js` polls `GET /article-jobs/{job_id}` directly, with one request in flight at a time, and persists each snapshot. Closing the popup stops polling without stopping backend work. Reopening restores the job ID and resumes GET polling; it does not create another job. `parseScript.js` renders the completed result and page highlights.
 
 ## Podcast-mode flow
 
@@ -87,8 +84,9 @@ Per-page job state is stored in `chrome.storage.local`. The backend keeps proces
 - `front-end/api.js` — low-level fetch adapter that builds endpoint URLs, tries configured backends, parses JSON/text errors, and throws consistent JavaScript errors.
 - `front-end/backendClient.js` — small domain API over `api.js` for health, article extraction/analysis, podcast jobs, polling, and transcript pagination.
 - `front-end/podcast.js` — pure podcast cache-key, compact-result, pagination, timestamp, and progress-label helpers shared by the worker, popup, and Node tests.
-- `front-end/background.js` — durable workflow controller: keeps separate article/podcast keys, performs article extraction fallbacks, discovers podcast hints, starts or resumes backend jobs, and saves every state transition.
-- `front-end/popup.js` — popup lifecycle controller: restores the selected mode, starts worker jobs, watches saved state, pages transcript turns, and seeks accessible page media by timestamp.
+- `front-end/article.js` — pure article cache-key, resumability, result, and progress-label helpers.
+- `front-end/background.js` — one-shot MV3 controller: captures optional page text, creates backend article jobs, stores their IDs, and releases its event so the worker can become idle.
+- `front-end/popup.js` — popup lifecycle controller: restores the selected mode, polls backend-owned article jobs directly while open, watches saved state, pages transcript turns, and seeks accessible page media by timestamp.
 - `front-end/parseScript.js` — UI/rendering and page-injection helpers for text normalization, bias phrase highlighting, result cards, tooltips, and citation links. Its exported `parseText` function is an older direct-from-popup pipeline; current production execution is owned by `background.js`.
 
 ### Test and evaluation harness
@@ -132,8 +130,8 @@ The workspace also contains ignored artifacts: `.venv/`, Python caches, `.DS_Sto
 ## Important maintenance notes
 
 - Treat `front-end/` as the production extension source. If `dist/` remains checked in, regenerate or synchronize it deliberately so reviews do not compare stale copies.
-- The `dist/chrome-extension-v1.0.1` directory name is historical and does not match its current `1.1.0` manifest.
+- The `dist/chrome-extension-v1.0.1` directory name is historical and does not match its current `1.1.2` manifest.
 - Production uses `background.js` for orchestration; the similarly named `parseText` pipeline in `parseScript.js` is not called by the shipping popup and can drift unless it is removed or explicitly retained for compatibility.
-- The tracked Python suites cover classification routing, quote/speaker attribution, signed handoffs, research provenance, podcast discovery/parsing, media bounds, window routing, and job contracts. The frontend Node suites cover presenter and pure podcast storage/pagination helpers.
+- The tracked Python suites cover classification routing, quote/speaker attribution, signed handoffs, research provenance, article/podcast job contracts, discovery/parsing, media bounds, and window routing. The frontend Node suites cover presenters, article helpers and worker lifecycle, and podcast storage/pagination helpers.
 - The integration harness is still live and network-dependent. It now exercises the production result renderer, but a passing report is not a regression test of the shipping service-worker/storage lifecycle.
-- Chrome may suspend Manifest V3 service workers. Persisting stages makes recovery visible, but a job promise that is not tied to a long-lived extension event is not a guarantee that work will finish after the popup closes.
+- Chrome exposes no supported API for an extension worker to terminate itself. Article analysis therefore uses one-shot worker events and backend-owned jobs. Once the create request completes, the worker has no article keepalive; Chrome may terminate it on its normal idle schedule. The current backend job registry is process-local, so a Render restart or multi-worker routing can lose an active job; the popup turns that 404 into a retryable error. Shared Redis/database queueing is required for persistence across backend restarts.

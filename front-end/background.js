@@ -1,13 +1,14 @@
-// MV3 service worker: owns extraction/analysis jobs and persists their lifecycle.
+// MV3 service worker: creates backend jobs, persists IDs, then becomes idle.
 import {
-  analyzeBiasText,
+  createArticleJob,
   createPodcastJob,
-  extractArticleFromUrl,
-  extractRenderedArticleFromUrl,
   getPodcastJob,
   getPodcastSegments,
-  researchText
 } from "./backendClient.js";
+import {
+  buildArticleAnalysisKey,
+  normalizeArticleUrl
+} from "./article.js";
 import {
   buildPodcastAnalysisKey,
   normalizePodcastResult,
@@ -15,15 +16,14 @@ import {
 } from "./podcast.js";
 
 const LEGACY_ANALYSIS_PREFIXES = ["factgpt:analysis:"];
-const ANALYSIS_PREFIX = "factgpt:v2:analysis:";
 const LATEST_KEY = "factgpt:v2:latestAnalysisKey";
 const LEGACY_LATEST_KEYS = ["factgpt:latestAnalysisKey"];
 const MIN_TEXT_CHARS = 200;
+const MAX_TEXT_CHARS = 50_000;
 const PODCAST_POLL_MS = 1500;
 
 // In-memory dedupe for the current service-worker lifetime. The durable copy
 // of progress/results lives in chrome.storage.local below.
-const runningJobs = new Map();
 const runningPodcastJobs = new Map();
 
 async function purgeLegacyAnalysisCache() {
@@ -38,37 +38,7 @@ async function purgeLegacyAnalysisCache() {
   }
 }
 
-async function recoverInterruptedArticleJobs() {
-  // Article work lives in this service worker, unlike backend-owned podcast
-  // jobs. If the worker starts with a persisted running article state, there is
-  // no in-memory promise left to finish it, so make retry available immediately.
-  const allData = await chrome.storage.local.get(null);
-  const recovered = {};
-  for (const [key, value] of Object.entries(allData)) {
-    if (!key.startsWith(ANALYSIS_PREFIX) || !value || typeof value !== "object") {
-      continue;
-    }
-    if (!["running", "queued"].includes(String(value.status || "").toLowerCase())) {
-      continue;
-    }
-    recovered[key] = {
-      ...value,
-      status: "error",
-      stage: "Previous analysis was interrupted.",
-      completedAt: Date.now(),
-      updatedAt: Date.now(),
-      error: "The previous analysis stopped before finishing. Run it again."
-    };
-  }
-  if (Object.keys(recovered).length) {
-    await chrome.storage.local.set(recovered);
-  }
-}
-
-const startupReady = Promise.all([
-  purgeLegacyAnalysisCache(),
-  recoverInterruptedArticleJobs()
-]).catch((error) => {
+const startupReady = purgeLegacyAnalysisCache().catch((error) => {
   console.debug("Analysis cache startup cleanup skipped:", normalizeText(error.message, "cleanup failed"));
 });
 
@@ -85,59 +55,6 @@ function normalizeArticleText(value, fallback = "") {
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return text || fallback;
-}
-
-function buildAnalysisKey(url) {
-  // Results are keyed by normalized page URL so reopening the popup on the
-  // same article can restore the latest saved analysis.
-  try {
-    const parsed = new URL(String(url ?? ""));
-    parsed.hash = "";
-    return `${ANALYSIS_PREFIX}${parsed.toString()}`;
-  } catch {
-    return `${ANALYSIS_PREFIX}${String(url ?? "").trim()}`;
-  }
-}
-
-function normalizeUrlForCompare(url) {
-  try {
-    const parsed = new URL(String(url ?? ""));
-    parsed.hash = "";
-    return parsed.toString();
-  } catch {
-    return String(url ?? "").trim();
-  }
-}
-
-async function tabStillOnUrl(tabId, originalUrl) {
-  // If the user navigated away, do not inject into the new page and accidentally
-  // analyze text from the wrong article.
-  if (!Number.isInteger(tabId)) {
-    return false;
-  }
-
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    return normalizeUrlForCompare(tab.url) === normalizeUrlForCompare(originalUrl);
-  } catch {
-    return false;
-  }
-}
-
-function shouldFallbackToDom(errorMessage) {
-  const text = String(errorMessage ?? "").toLowerCase();
-  return (
-    text.includes("failed to extract") ||
-    text.includes("fetch failed") ||
-    text.includes("network error fetching url") ||
-    text.includes("bot protection") ||
-    text.includes("blocked by bot protection") ||
-    text.includes("not enough readable text") ||
-    text.includes("timed out") ||
-    text.includes("protocol error") ||
-    text.includes("http2") ||
-    text.includes("playwright extraction failed")
-  );
 }
 
 async function saveAnalysisState(key, patch) {
@@ -406,160 +323,56 @@ async function extractVisibleTextFromTab(tabId) {
   return String(injection?.result ?? "").trim();
 }
 
-async function extractArticleText(url, tabId, key, signal) {
-  // Prefer the cheapest backend extraction first. The DOM and rendered paths are
-  // fallbacks for pages that block direct fetches or render content with JS.
-  try {
-    await saveAnalysisState(key, { stage: "Extracting readable text..." });
-    const data = await extractArticleFromUrl(url, signal);
-    const text = normalizeArticleText(data.text, "");
-    if (text.length >= MIN_TEXT_CHARS) {
-      return text;
-    }
-    throw new Error("Not enough readable text found on this page.");
-  } catch (error) {
-    if (!shouldFallbackToDom(error.message)) {
-      throw error;
-    }
-  }
-
-  if (await tabStillOnUrl(tabId, url)) {
-    await saveAnalysisState(key, { stage: "Reading visible page text..." });
-    let domText = "";
-    try {
-      domText = await extractVisibleTextFromTab(tabId);
-    } catch {
-      // Some browser pages cannot be scripted; Playwright remains the last-resort path.
-      domText = "";
-    }
-    if (domText.length >= MIN_TEXT_CHARS) {
-      return domText;
-    }
-  }
-
-  await saveAnalysisState(key, { stage: "Trying browser-rendered extraction..." });
-  const rendered = await extractRenderedArticleFromUrl(url, signal);
-  const renderedText = normalizeArticleText(rendered.text, "");
-  if (renderedText.length < MIN_TEXT_CHARS) {
-    throw new Error("Not enough readable text found on this page.");
-  }
-  return renderedText;
-}
-
-async function runAnalysisJob({ key, url, tabId, signal }) {
-  // The background worker owns long-running backend work. The popup only starts
-  // the job and later reads this saved state, so closing the popup does not
-  // immediately kill the analysis flow.
+async function startArticleJob({ key, url, tabId, runId }) {
+  await startupReady;
   await saveAnalysisState(key, {
-    status: "running",
-    stage: "Starting analysis...",
-    url,
+    mode: "article",
+    runId,
+    jobId: "",
+    status: "starting",
+    stage: "Sending article to the analysis service...",
+    progress: 0,
+    url: normalizeArticleUrl(url),
     tabId,
     startedAt: Date.now(),
     completedAt: null,
     error: "",
-    researchError: "",
-    partialResult: null,
+    retryable: true,
     result: null
   });
 
+  let visibleText = "";
   try {
-    const articleText = await extractArticleText(url, tabId, key, signal);
-
-    await saveAnalysisState(key, { stage: "Classifying passages and analyzing bias..." });
-    const biasResult = await analyzeBiasText(articleText, "Article Analysis", signal);
-    const aiBias = biasResult.ai_result || {};
-    const factOpinion = biasResult.fact_opinion || null;
-
-    // Save the bias result immediately; research can fail or take longer, but
-    // the user should still get the core bias scan when they reopen the popup.
-    await saveAnalysisState(key, {
-      status: "running",
-      stage: "Bias complete. Gathering sources...",
-      partialResult: {
-        ai_result: aiBias,
-        ai_research: {},
-        fact_opinion: factOpinion
-      }
-    });
-
-    try {
-      const researchResult = await researchText(
-        articleText,
-        "Article Analysis",
-        factOpinion,
-        aiBias,
-        signal
-      );
-      const finalFactOpinion = researchResult.fact_opinion || factOpinion;
-
-      await saveAnalysisState(key, {
-        status: "complete",
-        stage: "Analysis complete.",
-        completedAt: Date.now(),
-        result: {
-          ai_result: aiBias,
-          ai_research: researchResult.ai_research || {},
-          fact_opinion: finalFactOpinion
-        },
-        partialResult: null
-      });
-    } catch (error) {
-      if (signal?.aborted) {
-        throw error;
-      }
-      await saveAnalysisState(key, {
-        status: "partial",
-        stage: "Bias complete. Sources unavailable right now.",
-        completedAt: Date.now(),
-        result: {
-          ai_result: aiBias,
-          ai_research: {},
-          fact_opinion: factOpinion
-        },
-        partialResult: null,
-        researchError: normalizeText(error.message, "Research failed.")
-      });
-    }
-  } catch (error) {
-    if (signal?.aborted) {
-      return;
-    }
-    await saveAnalysisState(key, {
-      status: "error",
-      stage: "Analysis failed.",
-      completedAt: Date.now(),
-      error: normalizeText(error.message, "Analysis failed.")
-    });
+    visibleText = normalizeArticleText(await extractVisibleTextFromTab(tabId), "");
+  } catch {
+    // Restricted tabs cannot be scripted. The backend performs URL extraction.
   }
-}
 
-function startAnalysisJob({ key, url, tabId }) {
-  // A manual Analyze click is also a recovery action. Abort any request that
-  // survived in this worker after its persisted state became stale, then start
-  // a fresh run. The identity guard prevents the old promise from deleting the
-  // replacement job when its abort finishes.
-  runningJobs.get(key)?.controller.abort();
-  const controller = new AbortController();
-  let promise;
-  promise = runAnalysisJob({
-    key,
+  const created = await createArticleJob(
     url,
-    tabId,
-    signal: controller.signal
-  }).finally(() => {
-    if (runningJobs.get(key)?.promise === promise) {
-      runningJobs.delete(key);
-    }
+    runId,
+    visibleText.length >= MIN_TEXT_CHARS ? visibleText.slice(0, MAX_TEXT_CHARS) : ""
+  );
+  const jobId = normalizeText(created?.job_id, "");
+  if (!jobId) throw new Error("The analysis service did not return a job ID.");
+
+  const current = (await chrome.storage.local.get(key))[key] || {};
+  if (current.runId !== runId) return current;
+  return saveAnalysisState(key, {
+    jobId,
+    status: String(created?.status || "queued").toLowerCase(),
+    stage: normalizeText(created?.stage, "Article analysis queued."),
+    progress: 0,
+    createdAt: created?.created_at || new Date().toISOString(),
+    reused: Boolean(created?.reused)
   });
-  runningJobs.set(key, { controller, promise });
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // Popup messages are the entrypoint into this worker. Keep responses immediate;
   // the async job reports progress through chrome.storage.local.
   if (message?.type === "FACTGPT_ANALYSIS_KEY") {
-    sendResponse({ key: buildAnalysisKey(message.url) });
+    sendResponse({ key: buildArticleAnalysisKey(message.url) });
     return false;
   }
 
@@ -569,12 +382,24 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message?.type === "FACTGPT_START_ANALYSIS") {
-    const key = buildAnalysisKey(message.url);
-    startupReady.then(() => {
-      startAnalysisJob({ key, url: message.url, tabId: message.tabId });
-    });
-    sendResponse({ ok: true, key });
-    return false;
+    const key = buildArticleAnalysisKey(message.url);
+    const runId = normalizeText(message.runId, crypto.randomUUID());
+    startArticleJob({ key, url: message.url, tabId: message.tabId, runId })
+      .then((state) => sendResponse({ ok: true, key, state }))
+      .catch(async (error) => {
+        const current = (await chrome.storage.local.get(key))[key] || {};
+        if (current.runId === runId) {
+          await saveAnalysisState(key, {
+            status: "error",
+            stage: "Analysis could not start.",
+            completedAt: Date.now(),
+            retryable: true,
+            error: normalizeText(error.message, "Analysis could not start.")
+          });
+        }
+        sendResponse({ ok: false, key, error: normalizeText(error.message, "Analysis could not start.") });
+      });
+    return true;
   }
 
 

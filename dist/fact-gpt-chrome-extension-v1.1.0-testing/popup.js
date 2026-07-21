@@ -1,5 +1,10 @@
 // Popup controller: starts worker jobs and renders their durable storage state.
-import { warmBackend } from "./backendClient.js";
+import { getArticleJob, warmBackend } from "./backendClient.js";
+import {
+  articleStageText,
+  isResumableArticleState,
+  normalizeArticleResult
+} from "./article.js";
 import {
   highlightPhrasesInTab,
   normalizeHighlights,
@@ -19,7 +24,7 @@ import {
 export let capturedUrl = "";
 
 const POLL_MS = 800;
-const STALE_RUNNING_MS = 5 * 60 * 1000;
+const ARTICLE_POLL_MS = 2500;
 const SELECTED_MODE_KEY = "factgpt:v2:selectedMode";
 const MODES = Object.freeze({ article: "article", podcast: "podcast" });
 
@@ -27,6 +32,8 @@ let activeMode = MODES.article;
 let activeTab = null;
 let modeKeys = { article: "", podcast: "" };
 let transcriptState = { jobId: "", cursor: "", loading: false, hasMore: false };
+let articlePollInFlight = false;
+let articleLastPolledAt = 0;
 
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -69,10 +76,7 @@ function setSectionVisible(section, visible) {
 
 function isActiveRun(state) {
   const status = String(state?.status || "").toLowerCase();
-  return (
-    (status === "running" || status === "queued") &&
-    Date.now() - Number(state.updatedAt || state.startedAt || 0) < STALE_RUNNING_MS
-  );
+  return status === "starting" || status === "running" || status === "queued";
 }
 
 function isPodcastActiveRun(state) {
@@ -378,13 +382,15 @@ async function startCurrentMode() {
     ? "Starting podcast analysis..."
     : "Starting analysis...";
 
-  await sendRuntimeMessage({
+  const response = await sendRuntimeMessage({
     type: activeMode === MODES.podcast
       ? "FACTGPT_START_PODCAST_ANALYSIS"
       : "FACTGPT_START_ANALYSIS",
     url,
-    tabId: Number.isInteger(activeTab?.id) ? activeTab.id : null
+    tabId: Number.isInteger(activeTab?.id) ? activeTab.id : null,
+    ...(activeMode === MODES.article ? { runId: crypto.randomUUID() } : {})
   });
+  if (!response?.ok) throw new Error(response?.error || "Analysis could not start.");
   const saved = await getSavedAnalysis(modeKeys[activeMode]);
   renderCurrentState(saved || {
     status: "running",
@@ -417,6 +423,82 @@ async function resumePodcastIfNeeded(state) {
   }
 }
 
+async function refreshArticleIfNeeded(state, force = false) {
+  if (!isResumableArticleState(state) || articlePollInFlight) return;
+  const now = Date.now();
+  if (!force && now - articleLastPolledAt < ARTICLE_POLL_MS) return;
+  articlePollInFlight = true;
+  articleLastPolledAt = now;
+  const key = modeKeys.article;
+  const expectedRunId = state.runId;
+  const expectedJobId = state.jobId;
+
+  try {
+    const response = await getArticleJob(expectedJobId);
+    const current = await getSavedAnalysis(key);
+    if (current?.runId !== expectedRunId || current?.jobId !== expectedJobId) return;
+
+    const status = String(response?.status || "running").toLowerCase();
+    const patch = {
+      status: status === "failed" ? "error" : status,
+      stage: articleStageText(response?.stage),
+      progress: Number.isFinite(Number(response?.progress)) ? Number(response.progress) : null,
+      backendUpdatedAt: response?.updated_at || null,
+      lastCheckedAt: Date.now()
+    };
+    if (status === "complete") {
+      patch.completedAt = Date.now();
+      patch.progress = 100;
+      patch.retryable = false;
+      patch.result = normalizeArticleResult(response);
+      patch.error = "";
+    } else if (status === "failed") {
+      const backendError = response?.error;
+      const message = normalizeText(
+        typeof backendError === "object" ? backendError.message : backendError,
+        "Article analysis failed. Run it again."
+      );
+      patch.completedAt = Date.now();
+      patch.retryable = true;
+      const partial = normalizeArticleResult(response);
+      if (Object.keys(partial.ai_result).length) {
+        patch.status = "partial";
+        patch.stage = "Bias complete. Sources unavailable right now.";
+        patch.result = partial;
+        patch.researchError = message;
+        patch.error = "";
+      } else {
+        patch.error = message;
+      }
+    }
+    await chrome.storage.local.set({
+      [key]: { ...current, ...patch, key, updatedAt: Date.now() }
+    });
+  } catch (error) {
+    const current = await getSavedAnalysis(key);
+    if (current?.runId !== expectedRunId || current?.jobId !== expectedJobId) return;
+    const message = normalizeText(error.message, "Article job could not be checked.");
+    if (/not found|backend may have restarted|expired|HTTP 404|HTTP 410/i.test(message)) {
+      await chrome.storage.local.set({
+        [key]: {
+          ...current,
+          status: "error",
+          stage: "Article job is no longer available.",
+          completedAt: Date.now(),
+          updatedAt: Date.now(),
+          retryable: true,
+          error: `${message} Run the analysis again.`
+        }
+      });
+    } else {
+      // A temporary polling failure does not mean the backend-owned job stopped.
+      console.debug("Article status check skipped:", message);
+    }
+  } finally {
+    articlePollInFlight = false;
+  }
+}
+
 async function switchMode(mode) {
   activeMode = mode === MODES.podcast ? MODES.podcast : MODES.article;
   await chrome.storage.local.set({ [SELECTED_MODE_KEY]: activeMode });
@@ -436,6 +518,7 @@ async function switchMode(mode) {
   const saved = await getSavedAnalysis(modeKeys[activeMode]);
   renderCurrentState(saved);
   if (activeMode === MODES.podcast) await resumePodcastIfNeeded(saved);
+  else await refreshArticleIfNeeded(saved, true);
 }
 
 function watchStoredStates() {
@@ -449,6 +532,7 @@ function watchStoredStates() {
     const saved = await getSavedAnalysis(modeKeys[activeMode]);
     renderCurrentState(saved);
     if (activeMode === MODES.podcast) await resumePodcastIfNeeded(saved);
+    else await refreshArticleIfNeeded(saved);
   }, POLL_MS);
 }
 

@@ -56,6 +56,7 @@ cd back-end
 ../.venv/bin/python -m unittest -v test_podcast.py
 cd ..
 node front-end/test_presenters.mjs
+node front-end/test_article_helpers.mjs
 node front-end/test_podcast_helpers.mjs
 node front-end/test_background_lifecycle.mjs
 docker build -t factgpt-podcast .

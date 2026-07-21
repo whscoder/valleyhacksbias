@@ -203,6 +203,7 @@ RATE_LIMIT_REQUESTS = int(os.getenv("FACTGPT_RATE_LIMIT_PER_MINUTE", "45"))
 PROTECTED_PATHS = {
     "/analyze",
     "/analyze-bias",
+    "/article-jobs",
     "/classify-fact-opinion",
     "/research",
     "/extract",
@@ -267,6 +268,9 @@ MAX_PODCAST_PAGE_BYTES = int(
 PODCAST_JOB_TTL_SECONDS = int(
     os.getenv("FACTGPT_PODCAST_JOB_TTL_SECONDS", str(24 * 60 * 60))
 )
+ARTICLE_JOB_TTL_SECONDS = int(
+    os.getenv("FACTGPT_ARTICLE_JOB_TTL_SECONDS", str(24 * 60 * 60))
+)
 PODCAST_COMPACT_ITEMS = 100
 
 # The local artifact is binary, so it cannot represent mixed passages. These
@@ -316,6 +320,9 @@ FACT_OPINION_CACHE_SIZE = 128
 podcast_jobs: dict[str, dict[str, Any]] = {}
 podcast_jobs_by_url: dict[str, str] = {}
 podcast_job_tasks: dict[str, asyncio.Task] = {}
+article_jobs: dict[str, dict[str, Any]] = {}
+article_jobs_by_content: dict[str, str] = {}
+article_job_tasks: dict[str, asyncio.Task] = {}
 
 # Load local API key used by backend model calls.
 load_dotenv(Path(__file__).resolve().parent / "data" / "apikey.env")
@@ -376,7 +383,11 @@ def request_has_valid_api_token(request: Request) -> bool:
 
 def is_protected_path(path: str) -> bool:
     """Return whether a request path may trigger expensive backend work."""
-    return path in PROTECTED_PATHS or path.startswith("/podcast-jobs/")
+    return (
+        path in PROTECTED_PATHS
+        or path.startswith("/podcast-jobs/")
+        or path.startswith("/article-jobs/")
+    )
 
 
 def client_identifier(request: Request) -> str:
@@ -434,6 +445,22 @@ class AnalyzeRequest(BaseModel):
     """Input payload for bias/research endpoints."""
     text: str = Field(..., max_length=MAX_REQUEST_TEXT_CHARS)
     title: str = Field(default="Article Analysis", max_length=200)
+
+
+class ArticleJobRequest(BaseModel):
+    """Article input queued for backend-owned extraction and analysis."""
+
+    page_url: HttpUrl = Field(..., max_length=2048)
+    client_request_id: str = Field(default="", max_length=128)
+    text: str = Field(default="", max_length=MAX_REQUEST_TEXT_CHARS)
+    title: str = Field(default="Article Analysis", max_length=200)
+
+    @model_validator(mode="after")
+    def normalize_fields(self):
+        self.text = str(self.text or "").strip()
+        self.title = str(self.title or "").strip() or "Article Analysis"
+        self.client_request_id = str(self.client_request_id or "").strip()
+        return self
 
 
 class FactOpinionItem(BaseModel):
@@ -2139,6 +2166,225 @@ async def ensure_article_classification(
     return await classify_article_fact_opinion(text, title)
 
 
+class ArticleJobFailure(Exception):
+    """Expected article-job failure with a client-safe message."""
+
+    def __init__(
+        self,
+        message: str,
+        code: str = "article_job_failed",
+        reference: str | None = None,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.reference = reference
+
+
+def _article_content_key(request: ArticleJobRequest, client_id: str = "") -> str:
+    """Make retries idempotent without suppressing intentional re-analysis."""
+    if request.client_request_id:
+        identity = f"request\0{client_id}\0{request.client_request_id}"
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    # Backward compatibility for callers deployed before client_request_id.
+    # New extension runs always send an ID, so a fresh click creates a fresh job.
+    title = " ".join(request.title.split()).casefold()
+    supplied_text = (
+        str(request.text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    )
+    if supplied_text:
+        identity = f"text\0{client_id}\0{title}\0{supplied_text}"
+    else:
+        identity = f"url\0{client_id}\0{title}\0{_normalized_podcast_url(str(request.page_url))}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _cleanup_article_jobs() -> None:
+    """Expire terminal in-process article jobs without touching active tasks."""
+    now = time.time()
+    expired = [
+        job_id
+        for job_id, job in article_jobs.items()
+        if job.get("status") in {"complete", "failed"}
+        and now - float(job.get("updated_at", now)) > ARTICLE_JOB_TTL_SECONDS
+    ]
+    for job_id in expired:
+        job = article_jobs.pop(job_id, None)
+        if job:
+            content_key = str(job.get("content_key", ""))
+            if article_jobs_by_content.get(content_key) == job_id:
+                article_jobs_by_content.pop(content_key, None)
+        article_job_tasks.pop(job_id, None)
+
+
+def _update_article_job(job_id: str, **patch: Any) -> None:
+    job = article_jobs.get(job_id)
+    if job is None:
+        return
+    job.update(patch)
+    job["updated_at"] = time.time()
+
+
+async def _article_job_text(request: ArticleJobRequest) -> str:
+    """Use supplied page text or perform both extraction fallbacks in the job."""
+    supplied = normalize_analysis_text(request.text)
+    if len(supplied) >= MIN_EXTRACT_CHARS:
+        return supplied
+
+    page_url = str(request.page_url)
+    await validate_public_url(page_url)
+    extracted, direct_reason = await extract_text_with_httpx(page_url)
+    if extracted:
+        return normalize_analysis_text(extracted)
+    try:
+        rendered_html = await fetch_html_with_playwright(page_url)
+        rendered_text = cap_extracted_text(extract_readable_text(rendered_html))
+    except Exception as exc:
+        logger.info(
+            "Article rendered extraction failed; error_type=%s", type(exc).__name__
+        )
+        rendered_text = ""
+    if len(rendered_text) < MIN_EXTRACT_CHARS:
+        logger.info("Article extraction exhausted; direct_reason=%s", direct_reason)
+        raise ArticleJobFailure(
+            "The article text could not be extracted. Open the article fully and try again.",
+            "article_extraction_failed",
+        )
+    return normalize_analysis_text(rendered_text)
+
+
+async def run_article_job(job_id: str, request: ArticleJobRequest) -> None:
+    """Own article extraction, classification, bias, and research server-side."""
+    partial_result: dict[str, Any] | None = None
+
+    def stage(message: str, progress: int, **patch: Any) -> None:
+        _update_article_job(
+            job_id,
+            status="running",
+            stage=message,
+            progress=max(0, min(99, int(progress))),
+            **patch,
+        )
+
+    try:
+        stage("Extracting article text...", 5)
+        text = await _article_job_text(request)
+        if len(text) < MIN_EXTRACT_CHARS:
+            raise ArticleJobFailure(
+                "Not enough article text was available to analyze.",
+                "article_text_too_short",
+            )
+
+        stage("Classifying article passages...", 20)
+        try:
+            fact_opinion = await classify_article_fact_opinion(text, request.title)
+        except Exception as exc:
+            raise ArticleJobFailure(
+                "The fact-opinion classifier is unavailable. Please try again.",
+                "article_classification_failed",
+            ) from exc
+
+        partial_result = {
+            "status": "partial",
+            "ai_result": None,
+            "ai_research": None,
+            "fact_opinion": fact_opinion.model_dump(mode="json"),
+        }
+        stage("Analyzing article bias...", 45, result=partial_result)
+        factual_text, factual_quotes = build_factual_content(fact_opinion, text)
+        bias_text, bias_quotes = build_bias_content(fact_opinion, text)
+        candidate_claim_count = _research_candidate_count(fact_opinion)
+        article_input_truncated = len(str(request.text or "").strip()) > len(text)
+        if bias_text:
+            bias_raw = await analyze_bias(bias_text, request.title, bias_quotes)
+            if "error" in bias_raw:
+                detail = model_error_detail(bias_raw, "Bias analysis failed.")
+                raise ArticleJobFailure(
+                    detail["message"],
+                    detail.get("code", "article_bias_failed"),
+                    detail.get("reference"),
+                )
+            bias_result = validate_ai_bias(bias_raw, bias_text)
+        else:
+            bias_result = no_factual_bias_result()
+
+        partial_result["ai_result"] = bias_result.model_dump(mode="json")
+        stage("Researching factual claims...", 70, result=partial_result)
+        if factual_text:
+            research_raw = await researcher_ai(
+                factual_text,
+                request.title,
+                factual_quotes,
+                bias_result=bias_result,
+                candidate_claim_count=candidate_claim_count,
+                article_input_truncated=article_input_truncated,
+            )
+            if "error" in research_raw:
+                detail = model_error_detail(research_raw, "Research verification failed.")
+                raise ArticleJobFailure(
+                    detail["message"],
+                    detail.get("code", "article_research_failed"),
+                    detail.get("reference"),
+                )
+            research_result = validate_ai_research(
+                research_raw,
+                candidate_claim_count=candidate_claim_count,
+                total_factual_characters=len(factual_text),
+                article_input_truncated=article_input_truncated,
+            )
+        else:
+            research_result = no_factual_research_result(article_input_truncated)
+
+        result = {
+            **partial_result,
+            "status": "analyzed",
+            "ai_research": research_result.model_dump(mode="json"),
+        }
+        _update_article_job(
+            job_id,
+            status="complete",
+            stage="Article analysis complete.",
+            progress=100,
+            result=result,
+            error=None,
+            completed_at=time.time(),
+        )
+    except Exception as exc:
+        error_id = hashlib.sha256(
+            f"{time.time_ns()}:{type(exc).__name__}".encode("utf-8")
+        ).hexdigest()[:12]
+        logger.exception(
+            "Article job failed; job_id=%s error_id=%s error_type=%s",
+            job_id,
+            error_id,
+            type(exc).__name__,
+        )
+        if isinstance(exc, ArticleJobFailure):
+            safe_message = exc.message
+            error_code = exc.code
+            reference = exc.reference or error_id
+        else:
+            safe_message = "Article analysis failed. Please try again."
+            error_code = "article_job_failed"
+            reference = error_id
+        _update_article_job(
+            job_id,
+            status="failed",
+            stage="Article analysis failed.",
+            progress=100,
+            result=partial_result,
+            error={
+                "message": safe_message[:300],
+                "code": error_code,
+                "reference": reference,
+            },
+            completed_at=time.time(),
+        )
+    finally:
+        article_job_tasks.pop(job_id, None)
+
+
 def _normalized_podcast_url(url: str) -> str:
     parsed = urlsplit(str(url).strip())
     path = parsed.path.rstrip("/") or "/"
@@ -2904,6 +3150,86 @@ async def extract_text_rendered(req: URLRequest):
         return {"status": "extracted", "method": "playwright", "text": cap_extracted_text(rendered_text)}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Playwright extraction failed: {exc}") from exc
+
+
+@app.post("/article-jobs", status_code=202)
+async def create_article_job(payload: ArticleJobRequest, request: Request):
+    """Queue backend-owned article extraction, classification, and analysis."""
+    _cleanup_article_jobs()
+    client_id = client_identifier(request)
+    content_key = _article_content_key(payload, client_id)
+    existing_id = article_jobs_by_content.get(content_key)
+    existing = article_jobs.get(existing_id or "")
+    if existing and existing.get("status") in {"queued", "running", "complete"}:
+        return {
+            "job_id": existing_id,
+            "status": existing["status"],
+            "stage": existing["stage"],
+            "created_at": existing["created_at"],
+            "reused": True,
+        }
+
+    if any(
+        job.get("client_id") == client_id and job.get("status") in {"queued", "running"}
+        for job in article_jobs.values()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="An article analysis is already running for this client.",
+        )
+
+    job_id = secrets.token_urlsafe(24)
+    created_at = time.time()
+    article_jobs[job_id] = {
+        "job_id": job_id,
+        "client_id": client_id,
+        "content_key": content_key,
+        "page_url": str(payload.page_url),
+        "status": "queued",
+        "stage": "Article analysis queued.",
+        "progress": 0,
+        "created_at": created_at,
+        "updated_at": created_at,
+        "completed_at": None,
+        "result": None,
+        "error": None,
+    }
+    article_jobs_by_content[content_key] = job_id
+    task = asyncio.create_task(run_article_job(job_id, payload))
+    article_job_tasks[job_id] = task
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "stage": "Article analysis queued.",
+        "created_at": created_at,
+        "reused": False,
+    }
+
+
+@app.get("/article-jobs/{job_id}")
+async def get_article_job(job_id: str):
+    """Return article progress, a completed result, or preserved partial output."""
+    _cleanup_article_jobs()
+    job = article_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Article job was not found. The backend may have restarted; "
+                "start the analysis again."
+            ),
+        )
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "stage": job["stage"],
+        "progress": job["progress"],
+        "created_at": job["created_at"],
+        "updated_at": job["updated_at"],
+        "completed_at": job.get("completed_at"),
+        "error": job.get("error"),
+        "result": job.get("result"),
+    }
 
 
 @app.post("/podcast-jobs", status_code=202)
