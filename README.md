@@ -16,6 +16,83 @@ closing the popup is safe, but a backend restart requires starting the job again
 
 See [docs/architecture.md](docs/architecture.md) for the end-to-end flow and a purpose statement for every tracked file.
 
+## How Codex Was Used
+
+OpenAI Codex was used as a collaborative engineering assistant throughout the
+project. It helped inspect and understand the existing repository, implement
+and connect the fact/opinion, bias-analysis, source-research, and podcast
+workflows across the FastAPI backend and Chrome extension, and keep the source
+extension files synchronized with their packaged `dist/` copies.
+
+Codex also assisted with dataset normalization, classifier integration,
+deployment and security reviews, automated test creation, debugging, and
+end-to-end validation. Its changes were reviewed through repository diffs and
+verified with the backend, JavaScript, packaging, and container checks listed
+below. The primary Codex session for the core fact/opinion pipeline and
+backend/extension integration was
+`019f7cb2-d67c-78e2-9e76-c4fd268daec0`.
+
+## Local Setup
+
+### 1. Install the backend
+
+Install Python 3, FFmpeg (required for podcast transcription), and Chromium's
+Playwright dependencies. From the repository root, create an isolated Python
+environment and install the project packages:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+playwright install chromium
+```
+
+On macOS, FFmpeg can be installed with `brew install ffmpeg`. Copy the example
+environment file and replace its placeholders with your own secrets:
+
+```bash
+cp .env.example .env
+```
+
+Load those variables and start the API on port 8000:
+
+```bash
+set -a
+source .env
+set +a
+cd back-end
+../.venv/bin/python home.py
+```
+
+Open <http://127.0.0.1:8000/> to confirm that the backend is running. Never
+commit `.env` or an OpenAI API key.
+
+### 2. Load the Chrome extension
+
+The checked-in extension is configured to use the hosted production backend.
+To load it locally:
+
+1. Open `chrome://extensions` in Chrome.
+2. Enable **Developer mode**.
+3. Select **Load unpacked** and choose this repository's `front-end/` folder.
+4. Pin **Fact GPT**, open a supported article or podcast page, and launch the
+   extension.
+
+To use a locally running backend instead, temporarily set
+`configuredHostedUrl` in `front-end/config.js` to `http://127.0.0.1:8000`, add
+`http://127.0.0.1:8000/*` to `host_permissions` in
+`front-end/manifest.json`, and reload the unpacked extension. Either disable
+`FACTGPT_REQUIRE_ALLOWED_ORIGIN` for local development or set
+`FACTGPT_ALLOWED_ORIGIN_REGEX` to the exact unpacked extension ID shown by
+Chrome. Do not include these localhost overrides in a production package.
+
+### 3. Run the checks
+
+After setup, run the deterministic commands in [Validation](#validation).
+They do not make paid OpenAI requests unless a live smoke test is explicitly
+enabled.
+
 ## Production Security Checklist
 
 - Keep `OPENAI_API_KEY` only in the deployment secret store, such as Render environment variables. Do not commit or package `back-end/data/apikey.env`.
