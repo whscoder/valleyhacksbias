@@ -2,19 +2,18 @@
 
 Chrome extension plus FastAPI backend for article bias and reliability analysis.
 
-The extension has two modes:
+The extension has 1 mode:
 
 - **Article** extracts the current page and runs the existing fact/opinion,
   bias, and source-backed research pipeline.
-- **Podcast** inspects the current open-web episode page, prefers a publisher
-  transcript, and otherwise transcribes a public audio enclosure with safe
-  speaker labels and timestamps before running episode-wide analysis.
+-
 
+FUTURE I WANT TO ADD PODCAST MODE 
 Podcast mode does not capture tab audio or bypass authenticated, DRM, blob, or
 protected iframe players. Long work is queued in the current backend process;
 closing the popup is safe, but a backend restart requires starting the job again.
 
-See [docs/architecture.md](docs/architecture.md) for the end-to-end flow and a purpose statement for every tracked file.
+See [docs/architecture.md](docs/architecture.md) for the end-to-end flow and a purpose statement for every tracked file. (ignore things about podcast mode)
 
 ## How Codex Was Used
 
